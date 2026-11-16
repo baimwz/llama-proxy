@@ -21,11 +21,15 @@ health_interval_s = 2.0
 read_timeout_s = 300                               # max gap between upstream chunks
 
 [power]
-# Power OFF the whole Proxmox host via SSH.
-# user "root" -> remote command defaults to plain `poweroff`;
-# any other user -> `sudo -n poweroff` (needs NOPASSWD for poweroff).
-ssh_host = "proxmox.example"                       # LAN IP (WoL only works on the physical LAN)
-ssh_user = "root"
+# Power OFF the whole Proxmox host via SSH (primary path).
+# Recommended: a locked-down non-root user -> remote command defaults to
+# `sudo -n poweroff`; the host then only needs:
+#   llama ALL=(root) NOPASSWD: /usr/sbin/poweroff
+# (user "root" would run plain `poweroff` - full root over SSH, avoid.)
+# Optional extra layer: scripts/proxmox-idle-poweroff.sh on the host
+# (safety net if the Pi is down; powers off after N h without LLM activity).
+ssh_host = "proxmox.example"                       # LAN IP / direct link (e.g. 10.42.0.2)
+ssh_user = "llama"
 ssh_key_path = "/home/pi/.ssh/id_ed25519_proxmox"  # SECRET: key file, not in repo
 # ssh_command = "poweroff"                         # optional override of the remote command
 # pre_shutdown_command = "pct stop 100"            # optional: run BEFORE poweroff

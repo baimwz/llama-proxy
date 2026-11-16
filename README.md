@@ -146,12 +146,14 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 - llama.cpp as a **systemd service on the host** (auto-start after boot), e.g.
   `llama-server -m qwen3-27b-q4_K_M.gguf --ctx-size 16384 --parallel 2
-  --api-key <service-key>` – or a VM/LXC with *Start at boot*.
-- a **dedicated SSH user** `proxy` with key login and a locked-down sudoers
+  --api-key <service-key>` – or a VM/LXC with *Start at boot* (recommended:
+  an LXC, e.g. id 100; the proxy's `llm.base_url` then points at the
+  container's IP/port).
+- a **dedicated SSH user** `llama` with key login and a locked-down sudoers
   rule (no full root):
   ```
   # /etc/sudoers.d/llama-proxy
-  proxy ALL=(root) NOPASSWD: /usr/sbin/poweroff
+  llama ALL=(root) NOPASSWD: /usr/sbin/poweroff
   ```
   (`visudo -cf /etc/sudoers.d/llama-proxy` to check syntax)
 - **Wake-on-LAN**: enable WoL for the server NIC in BIOS/UEFI. The Pi must be
@@ -194,6 +196,25 @@ a ~17 GB model download ~9 min at 300 Mbit / ~3 min at 1 Gbit.
 **Caveats:** the Pi is now the host's internet (SPOF for apt/downloads – the
 LLM itself keeps serving). Keep `Restart=always`, a good 5 A PSU, and the USB
 adapter on a USB 3.0 port.
+
+### Safety net: server-side idle poweroff (optional)
+
+llama-proxy shuts the host down after the idle timeout – but if the Pi itself
+is down, the server would keep burning standby power.
+`scripts/proxmox-idle-poweroff.sh` installs a small Proxmox daemon that
+powers the host off when the LLM container shows **no network activity** for
+N hours (default **2 h** – a fallback, not the primary path). It works
+without llama.cpp's metrics endpoints: it just watches the LXC's rx/tx byte
+counters.
+
+```bash
+sudo scripts/proxmox-idle-poweroff.sh show             # config + current LXC activity
+sudo scripts/proxmox-idle-poweroff.sh install          # stable path + systemd unit (idempotent, backs up)
+sudo scripts/proxmox-idle-poweroff.sh uninstall        # revert
+```
+
+Options: `--lxc-id 100` (default), `--lxc-iface eth0` (default),
+`--timeout 7200` (default), `--interval 30`, `--probe CMD` (testing).
 
 ### Client examples
 
@@ -367,7 +388,7 @@ Selected metrics: `llama_proxy_state`, `llama_proxy_queue_size`,
   (`chmod 600`); they are the only long-lived secrets/statistics on disk.
 - Tailscale/LAN is the intended perimeter; no public TLS is required, but add
   one if you expose the port publicly.
-- The `proxy` SSH user on the Proxmox host can only run `poweroff`.
+- The `llama` SSH user on the Proxmox host can only run `poweroff`.
 
 ## Troubleshooting
 

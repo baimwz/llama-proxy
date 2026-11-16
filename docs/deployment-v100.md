@@ -105,22 +105,45 @@ health checks. This is the fastest WoL round-trip test once the Pi is up.
 
 ## Shutdown (Pi → server)
 
+Primary path (chosen): a **locked-down non-root SSH user** (e.g. `llama`) on
+the Proxmox host; the proxy runs `sudo -n poweroff`:
+
 ```
-ssh root@<SERVER_IP> 'poweroff'
+ssh llama@<SERVER_IP> 'sudo -n poweroff'
+```
+
+Host-side setup (one sudoers line, nothing else):
+
+```
+# /etc/sudoers.d/llama-proxy
+llama ALL=(root) NOPASSWD: /usr/sbin/poweroff
 ```
 
 - Proxmox `poweroff` stops the guests (incl. the LLM container) as part of
-  the host shutdown — no separate container stop needed in the common case.
+  the host shutdown — `pre_shutdown_command` stays **empty** by default.
 - llama-proxy mapping (`[power]` in `config.toml`):
-  - `ssh_host` / `ssh_user` / `ssh_key_path` — the SSH access (LAN IP;
-    Tailscale name also works for the *shutdown*, not for the wake)
-  - `ssh_command` — optional override of the remote command; **empty =
-    sensible default**: `poweroff` for user `root`, `sudo -n poweroff` for a
-    locked-down non-root user
+  - `ssh_host` / `ssh_user` / `ssh_key_path` — the SSH access (LAN IP or
+    direct-link IP)
+  - `ssh_command` — optional override; **empty = sensible default**:
+    `poweroff` for user `root`, `sudo -n poweroff` for any non-root user
   - `pre_shutdown_command` — optional remote command run **before** the
-    poweroff, e.g. `pct stop 100` to stop the LLM container gracefully.
-    A failure here is logged and does **not** abort the shutdown (the host
-    poweroff stops guests anyway).
+    poweroff (e.g. graceful LXC stop). Not needed here: the host poweroff
+    stops guests anyway. A failure would only be logged, never block.
+
+### Safety net (chosen): server-side idle poweroff
+
+If the Pi dies, the proxy cannot initiate the shutdown. A small Proxmox
+daemon (`scripts/proxmox-idle-poweroff.sh`) powers the host off after
+**2 h** without LLM activity (LXC network counters; no llama.cpp metrics
+dependency):
+
+```bash
+sudo scripts/proxmox-idle-poweroff.sh show
+sudo scripts/proxmox-idle-poweroff.sh install
+```
+
+The proxy (20 min idle) remains the primary, precise path; the daemon is a
+coarse fallback that can never misfire mid-job (2 h window).
 
 ## Gotchas (learned the hard way)
 
@@ -158,12 +181,14 @@ ssh root@<SERVER_IP> 'poweroff'
       idle → `poweroff` → server off → next request re-wakes
 - [ ] optional: `scripts/setup-llm-gateway.sh` for LLM-host internet (see README)
 
-## Open design questions (current answers)
+## Decided design points (2026-11-16)
 
-| Question | Current answer |
+| Question | Decision |
 |---|---|
 | What triggers "Bedarf" (wake)? | Any inbound API request on `:8080`, or manual `POST /admin/wake`. |
-| SSH access for shutdown? | `root@<server>` + key (assumed — **to confirm**: key file, host name). |
-| Pi position in target network? | Same L2 as the server via LAN cable (**to confirm**: direct cable vs. switch/VLAN). |
-| Graceful LXC/VM stop before poweroff? | Optional `pre_shutdown_command`; failure does not block shutdown. |
-| Idle timeout value? | Default 20 min (`idle_timeout_s = 1200`); **to confirm**. |
+| SSH access for shutdown? | **A2**: locked-down non-root user (e.g. `llama`) + `sudo -n poweroff`; no root over SSH. |
+| Pi position in target network? | **Direct cable Pi ↔ server**; the Pi is the server's uplink (gateway mode). Suggested link: Pi `10.42.0.1/24`, server `10.42.0.2/24`. |
+| Graceful LXC/VM stop before poweroff? | **Not needed** — `pre_shutdown_command` stays empty (host poweroff stops guests). |
+| Idle timeout value? | **20 min** (`idle_timeout_s = 1200`). |
+| Pi dies → server stays on? | **Safety net**: `scripts/proxmox-idle-poweroff.sh` on the host, 2 h without LLM activity → poweroff. |
+

@@ -1,0 +1,46 @@
+# LlamaProxy configuration.
+# Copy to config.toml (same directory) and fill in real values.
+# Values marked SECRET must never be committed to the repository.
+
+[proxy]
+listen_host = "0.0.0.0"
+listen_port = 8080
+master_api_key = "CHANGE-ME-long-random-string"   # SECRET: required by all clients
+idle_timeout_s = 1200            # shutdown server after 20 min without requests
+client_wait_timeout_s = 600      # max wait for non-streaming requests
+sse_heartbeat_s = 15             # SSE keep-alive comment interval while booting
+
+[llm]
+base_url = "http://llama-server.example:8080"     # Tailscale MagicDNS name or LAN IP
+api_key = "CHANGE-ME"                              # SECRET: matches llama.cpp --api-key
+model_name = "qwen3-27b"                           # reported on GET /v1/models
+boot_timeout_s = 300                               # max wait for health after wake
+health_interval_s = 2.0
+read_timeout_s = 300                               # max gap between upstream chunks
+
+[power]
+# Power OFF the whole Proxmox host via SSH (dedicated user, NOPASSWD poweroff).
+ssh_host = "proxmox.example"                       # Tailscale name or LAN IP
+ssh_user = "proxy"
+ssh_key_path = "/home/pi/.ssh/id_ed25519_proxmox"  # SECRET: key file, not in repo
+# Power ON via Wake-on-LAN (must be reachable on the physical LAN).
+wol_mac = "AA:BB:CC:DD:EE:FF"
+# wol_bcast = "192.168.1.255"                      # default: 255.255.255.255
+shutdown_verify_timeout_s = 30
+
+[scheduler]
+large_threshold_tokens = 4096   # "new" prompt tokens >= this -> Large job
+small_max_concurrent = 2        # must be <= llama.cpp --parallel
+large_exclusive = true          # Large job blocks ALL other jobs while running
+classification = "delta"        # "delta" (new tokens only) or "total" (full prompt)
+conv_state_ttl_s = 1800         # conversation cache state lifetime
+conv_state_max = 128            # LRU cap for conversation states
+
+[usage]
+data_dir = "./data"             # only periodic usage flushes land here
+flush_interval_s = 60
+
+[tokenizer]
+# Local token counting (downloaded once, cached in data_dir).
+url = "https://huggingface.co/Qwen/Qwen3-27B/resolve/main/tokenizer.json"
+# Set url = "" to force the conservative character heuristic.

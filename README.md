@@ -161,6 +161,40 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 - **Tailscale** on both machines (optional but recommended) for stable MagicDNS
   names and remote access.
 
+### Optional: LLM host internet through the Pi (gateway mode)
+
+If the Proxmox host has only one NIC (the cable to the Pi) but you still want
+internet on it (apt updates, HuggingFace model downloads), the Pi can act as a
+small NAT gateway. The host stays invisible to the rest of the LAN.
+
+```bash
+sudo scripts/setup-llm-gateway.sh show            # detect + preview
+sudo scripts/setup-llm-gateway.sh apply           # configure (idempotent, backs up)
+sudo scripts/setup-llm-gateway.sh test            # verify from the Pi
+sudo scripts/setup-llm-gateway.sh proxmox-config  # copy this onto the host
+sudo scripts/setup-llm-gateway.sh uninstall       # revert
+```
+
+What it does (per-network-manager: systemd-networkd / NetworkManager /
+ifupdown):
+
+- LLM interface (auto-detected as USB) gets `10.42.0.1/24`
+- enables IPv4 forwarding
+- nftables: forward `10.42.0.0/24 -> LAN` + MASQUERADE, forward policy `drop`
+- backs up every modified file to `/var/backups/llama-gateway/`
+
+On the Proxmox host: set the printed stanza in `/etc/network/interfaces`
+(static `10.42.0.2/24`, gateway `10.42.0.1`, DNS), then
+`systemctl restart networking`.
+
+**Bandwidth:** a Pi 4 NATs roughly **500–800 Mbit/s** – your home connection
+will be the ceiling before the Pi is. Real-world: apt updates take seconds,
+a ~17 GB model download ~9 min at 300 Mbit / ~3 min at 1 Gbit.
+
+**Caveats:** the Pi is now the host's internet (SPOF for apt/downloads – the
+LLM itself keeps serving). Keep `Restart=always`, a good 5 A PSU, and the USB
+adapter on a USB 3.0 port.
+
 ### Client examples
 
 ```bash

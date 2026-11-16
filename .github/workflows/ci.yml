@@ -26,3 +26,12 @@ jobs:
         run: ruff check .
       - name: Pytest
         run: pytest -q
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: bash -n scripts/setup-llm-gateway.sh
+      - name: Shellcheck
+        run: shellcheck scripts/setup-llm-gateway.sh

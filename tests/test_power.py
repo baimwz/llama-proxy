@@ -5,7 +5,15 @@ import pytest
 from llama_proxy.config import Config
 from llama_proxy.conversation import ConversationTracker
 from llama_proxy.metrics import Metrics
-from llama_proxy.power import PowerError, PowerManager, ProxyState
+from llama_proxy.power import (
+    WOL_PORTS,
+    PowerError,
+    PowerManager,
+    ProxyState,
+    SshPoweroff,
+    build_magic_packet,
+    default_remote_poweroff,
+)
 
 
 class FakeLLM:
@@ -208,3 +216,75 @@ async def test_recently_healthy_window(tmp_path):
     assert pm.recently_healthy()
     pm.last_healthy_at = _time.time() - 999
     assert not pm.recently_healthy()
+
+
+async def test_wol_ports_includes_confirmed(tmp_path):
+    # Port 9 is the legacy port confirmed working on an ASRock B450 Pro4;
+    # the common modern ports must also be tried.
+    assert 9 in WOL_PORTS
+    assert 7 in WOL_PORTS
+    assert 40 in WOL_PORTS
+    assert 4711 in WOL_PORTS
+
+
+def test_magic_packet_format():
+    pkt = build_magic_packet("aa:bb:cc:dd:ee:ff")
+    assert len(pkt) == 6 + 6 * 16
+    assert pkt[:6] == b"\xff" * 6
+    assert pkt[6:12] == bytes.fromhex("aabbccddeeff")
+    # the MAC is repeated 16 times
+    assert pkt == b"\xff" * 6 + bytes.fromhex("aabbccddeeff") * 16
+
+
+def test_default_remote_poweroff_by_user():
+    assert default_remote_poweroff("root") == ["poweroff"]
+    assert default_remote_poweroff("proxy") == ["sudo", "-n", "poweroff"]
+
+
+def test_sshpoweroff_command_selection():
+    # root -> plain poweroff
+    assert SshPoweroff("h", "root", "k").remote_command == ["poweroff"]
+    # non-root -> sudo -n poweroff
+    assert SshPoweroff("h", "proxy", "k").remote_command == ["sudo", "-n", "poweroff"]
+    # explicit custom command wins
+    assert SshPoweroff("h", "root", "k", "pct stop 100 && poweroff").remote_command == [
+        "pct", "stop", "100", "&&", "poweroff"
+    ]
+
+
+async def test_pre_shutdown_runs_before_poweroff(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake, power={"shutdown_verify_timeout_s": 0.2})
+    order: list[str] = []
+
+    async def pre() -> None:
+        order.append("pre")
+
+    async def off() -> None:
+        order.append("off")
+
+    pm.set_backends(power_off=off, pre_shutdown=pre)
+    pm.mark_ready()
+    await pm.shutdown()
+    assert order == ["pre", "off"]
+    assert pm.state is ProxyState.OFF
+
+
+async def test_pre_shutdown_failure_still_powers_off(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake, power={"shutdown_verify_timeout_s": 0.2})
+    order: list[str] = []
+
+    async def pre_boom() -> None:
+        order.append("pre")
+        raise RuntimeError("pct not found")
+
+    async def off() -> None:
+        order.append("off")
+
+    pm.set_backends(power_off=off, pre_shutdown=pre_boom)
+    pm.mark_ready()
+    await pm.shutdown()
+    # pre-shutdown failed but we still powered off (host stops guests anyway)
+    assert order == ["pre", "off"]
+    assert pm.state is ProxyState.OFF

@@ -36,8 +36,15 @@ class PowerConfig:
     ssh_host: str = ""
     ssh_user: str = "proxy"
     ssh_key_path: str = ""
+    # Remote command for shutdown. Empty = sensible default:
+    # "poweroff" for root, "sudo -n poweroff" otherwise.
+    ssh_command: str = ""
+    # Optional remote command run BEFORE poweroff, e.g. "pct stop 100"
+    # to stop the LLM container gracefully. Failure does not abort the
+    # shutdown (a host poweroff stops guests anyway).
+    pre_shutdown_command: str = ""
     wol_mac: str = ""
-    wol_bcast: str = ""
+    wol_bcast: str = ""  # empty = 255.255.255.255 (limited broadcast, same L2)
     shutdown_verify_timeout_s: float = 30.0
 
 

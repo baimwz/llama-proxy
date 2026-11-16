@@ -99,6 +99,22 @@ async def keys_remove(request: web.Request) -> web.Response:
     return web.Response(status=204)
 
 
+async def wake_server(request: web.Request) -> web.Response:
+    """Wake the LLM server on demand (master key) - handy for WoL testing."""
+    if not _master(request):
+        return err("master API key required", 403)
+    power = request.app["power"]
+    if power.state.value == "ready":
+        return web.json_response({"state": power.state.value, "boot_seconds": None})
+    try:
+        await power.ensure_ready()
+    except Exception as exc:  # noqa: BLE001
+        return err(f"wake failed: {exc}", 503)
+    return web.json_response(
+        {"state": power.state.value, "boot_seconds": power.last_boot_s}
+    )
+
+
 async def usage_view(request: web.Request) -> web.Response:
     if not _master(request):
         return err("master API key required", 403)
@@ -116,3 +132,4 @@ def setup(app: web.Application) -> None:
     app.router.add_patch("/admin/keys/{name}", keys_update)
     app.router.add_delete("/admin/keys/{name}", keys_remove)
     app.router.add_get("/admin/usage", usage_view)
+    app.router.add_post("/admin/wake", wake_server)

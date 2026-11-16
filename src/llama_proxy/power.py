@@ -9,6 +9,7 @@ import asyncio
 import logging
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from urllib.parse import urlparse
 
@@ -42,6 +43,11 @@ class PowerError(RuntimeError):
 # Wake-on-LAN
 # ---------------------------------------------------------------------------
 
+# Ports to try, in order. 9 and 7 are the legacy ports (confirmed working on
+# an ASRock B450 Pro4); 40/4711 are the common modern ones. NICs differ, so
+# send to all of them - the extra datagrams are free.
+WOL_PORTS = (9, 7, 40, 4711)
+
 
 def build_magic_packet(mac: str) -> bytes:
     b = bytes.fromhex(mac.replace(":", "").replace("-", ""))
@@ -57,7 +63,7 @@ async def send_magic_packet(mac: str, broadcast: str = "255.255.255.255") -> Non
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            for port in (40, 4711):
+            for port in WOL_PORTS:
                 sock.sendto(pkt, (broadcast, port))
         finally:
             sock.close()
@@ -70,13 +76,30 @@ async def send_magic_packet(mac: str, broadcast: str = "255.255.255.255") -> Non
 # ---------------------------------------------------------------------------
 
 
+def default_remote_poweroff(user: str) -> list[str]:
+    """poweroff for root, `sudo -n poweroff` for a locked-down non-root user."""
+    return ["poweroff"] if user == "root" else ["sudo", "-n", "poweroff"]
+
+
 class SshPoweroff:
-    def __init__(self, host: str, user: str, key_path: str) -> None:
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        key_path: str,
+        command: str = "",
+    ) -> None:
         self._host = host
         self._user = user
         self._key = key_path
+        # custom remote command wins; otherwise the sensible default for the user
+        self._remote = command.split() if command else default_remote_poweroff(user)
 
-    async def poweroff(self) -> None:
+    @property
+    def remote_command(self) -> list[str]:
+        return list(self._remote)
+
+    async def _ssh(self, remote: list[str], timeout: float) -> None:
         cmd = [
             "ssh",
             "-o", "BatchMode=yes",
@@ -84,7 +107,7 @@ class SshPoweroff:
             "-o", "StrictHostKeyChecking=accept-new",
             "-i", self._key,
             f"{self._user}@{self._host}",
-            "sudo", "-n", "poweroff",
+            *remote,
         ]
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -92,12 +115,21 @@ class SshPoweroff:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except (TimeoutError, OSError) as exc:
-            raise PowerError(f"ssh poweroff failed: {exc}") from exc
+            raise PowerError(f"ssh command failed: {exc}") from exc
         if proc.returncode != 0:
             detail = (err or b"").decode(errors="replace")[:300]
-            raise PowerError(f"ssh poweroff rc={proc.returncode}: {detail}")
+            raise PowerError(f"ssh command rc={proc.returncode}: {detail}")
+
+    async def poweroff(self) -> None:
+        await self._ssh(self._remote, timeout=30)
+
+    async def run(self, remote_command: str, timeout: float = 60.0) -> None:
+        """Run an arbitrary remote command (e.g. 'pct stop 100')."""
+        if not remote_command.strip():
+            return
+        await self._ssh(remote_command.split(), timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +162,13 @@ class PowerManager:
             bcast = p.wol_bcast or "255.255.255.255"
             mac = p.wol_mac
             self._power_on = lambda: send_magic_packet(mac, bcast)
-        self._power_off = None
+        self._pre_shutdown: Callable[[], Awaitable[None]] | None = None
+        self._power_off: Callable[[], Awaitable[None]] | None = None
         if p.ssh_host:
-            self._power_off = SshPoweroff(p.ssh_host, p.ssh_user, p.ssh_key_path).poweroff
+            ssh = SshPoweroff(p.ssh_host, p.ssh_user, p.ssh_key_path, p.ssh_command)
+            self._power_off = ssh.poweroff
+            if p.pre_shutdown_command:
+                self._pre_shutdown = lambda: ssh.run(p.pre_shutdown_command)
         if self._power_on is None and self._power_off is None:
             log.info("no power backend configured - assuming the LLM server is always on")
 
@@ -221,6 +257,13 @@ class PowerManager:
             log.info("no power-off backend configured; skipping shutdown")
             return
         self.state = ProxyState.SHUTTING
+        if self._pre_shutdown is not None:
+            try:
+                await self._pre_shutdown()
+                log.info("pre-shutdown command finished")
+            except Exception as exc:  # noqa: BLE001
+                # not fatal: a host poweroff stops guests anyway
+                log.warning("pre-shutdown command failed (continuing): %s", exc)
         try:
             await self._power_off()
         except Exception as exc:  # noqa: BLE001
@@ -297,12 +340,14 @@ class PowerManager:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def set_backends(self, power_on=None, power_off=None) -> None:
+    def set_backends(self, power_on=None, power_off=None, pre_shutdown=None) -> None:
         """Override wake/shutdown backends (used in tests)."""
         if power_on is not None:
             self._power_on = power_on
         if power_off is not None:
             self._power_off = power_off
+        if pre_shutdown is not None:
+            self._pre_shutdown = pre_shutdown
 
     async def aclose(self) -> None:
         task = self._wake_task

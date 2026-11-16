@@ -11,7 +11,9 @@ client_wait_timeout_s = 600      # max wait for non-streaming requests
 sse_heartbeat_s = 15             # SSE keep-alive comment interval while booting
 
 [llm]
-base_url = "http://llama-server.example:8080"     # Tailscale MagicDNS name or LAN IP
+# The LLM typically runs inside a Proxmox LXC container (e.g. LXC 100) -
+# point this at the CONTAINER's address, not the bare host.
+base_url = "http://llama-server.example:8080"     # LXC IP:port or Tailscale name
 api_key = "CHANGE-ME"                              # SECRET: matches llama.cpp --api-key
 model_name = "qwen3-27b"                           # reported on GET /v1/models
 boot_timeout_s = 300                               # max wait for health after wake
@@ -19,13 +21,19 @@ health_interval_s = 2.0
 read_timeout_s = 300                               # max gap between upstream chunks
 
 [power]
-# Power OFF the whole Proxmox host via SSH (dedicated user, NOPASSWD poweroff).
-ssh_host = "proxmox.example"                       # Tailscale name or LAN IP
-ssh_user = "proxy"
+# Power OFF the whole Proxmox host via SSH.
+# user "root" -> remote command defaults to plain `poweroff`;
+# any other user -> `sudo -n poweroff` (needs NOPASSWD for poweroff).
+ssh_host = "proxmox.example"                       # LAN IP (WoL only works on the physical LAN)
+ssh_user = "root"
 ssh_key_path = "/home/pi/.ssh/id_ed25519_proxmox"  # SECRET: key file, not in repo
-# Power ON via Wake-on-LAN (must be reachable on the physical LAN).
-wol_mac = "AA:BB:CC:DD:EE:FF"
-# wol_bcast = "192.168.1.255"                      # default: 255.255.255.255
+# ssh_command = "poweroff"                         # optional override of the remote command
+# pre_shutdown_command = "pct stop 100"            # optional: run BEFORE poweroff
+                                                    # (graceful LXC stop; failure does not abort)
+# Power ON via Wake-on-LAN (sender must be in the same L2 as the server;
+# Tailscale cannot carry WoL). Ports tried: 9, 7, 40, 4711.
+wol_mac = "AA:BB:CC:DD:EE:FF"                      # STABLE: the server's LAN NIC MAC (see docs/deployment-v100.md)
+# wol_bcast = "192.168.1.255"                      # VARIABLE: subnet broadcast; default 255.255.255.255
 shutdown_verify_timeout_s = 30
 
 [scheduler]

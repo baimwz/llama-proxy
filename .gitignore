@@ -13,6 +13,9 @@ data/
 config.toml
 .env
 
+# Local, machine-specific deployment notes (real MACs, IPs, LXC names)
+docs/deployment-local.md
+
 # Downloaded model assets
 tokenizer.json
 

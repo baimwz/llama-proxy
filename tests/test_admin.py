@@ -92,3 +92,29 @@ async def test_user_key_lifecycle(app_env):
     await client.patch("/admin/keys/alice", json={"disabled": False}, headers=h)
     resp = await client.post("/v1/chat/completions", json=chat_payload(), headers=uh)
     assert resp.status == 200
+
+
+async def test_admin_wake_endpoint(app_env):
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+
+    # not master -> 403
+    resp = await client.post("/admin/wake")
+    assert resp.status == 403
+
+    # server already ready -> instant, no boot seconds
+    h = {"Authorization": "Bearer mkey"}
+    resp = await client.post("/admin/wake", headers=h)
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["state"] == "ready"
+
+    # server off -> wake path (mock is healthy, so this just polls health)
+    from llama_proxy.power import ProxyState
+
+    app["power"].state = ProxyState.OFF
+    resp = await client.post("/admin/wake", headers=h)
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["state"] == "ready"
+    assert body["boot_seconds"] is not None

@@ -133,3 +133,87 @@ async def test_completions_endpoint(app_env):
     app, client = app_env
     resp = await client.post("/v1/completions", json={"prompt": "hi"})
     assert resp.status in (200, 502)
+
+
+async def test_user_key_auth(app_env):
+    """Once keys are configured, every /v1/* request needs a valid key."""
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+    _, key = app["keys"].create("alice")
+
+    resp = await client.post("/v1/chat/completions", json=chat_payload())
+    assert resp.status == 401
+    resp = await client.get("/v1/models")
+    assert resp.status == 401
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json=chat_payload(),
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert resp.status == 200
+    assert "alice" in app["usage"].totals()  # usage recorded under the user
+
+
+async def test_rate_limit_429(app_env):
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+    _, key = app["keys"].create("alice", requests_per_hour=2)
+    h = {"Authorization": f"Bearer {key}"}
+
+    assert (await client.post("/v1/chat/completions", json=chat_payload(), headers=h)).status == 200
+    assert (await client.post("/v1/chat/completions", json=chat_payload(), headers=h)).status == 200
+    resp = await client.post("/v1/chat/completions", json=chat_payload(), headers=h)
+    assert resp.status == 429
+    assert int(resp.headers["Retry-After"]) >= 1
+    body = await resp.json()
+    assert body["error"]["type"] == "rate_limit_exceeded"
+
+    # other users and the master key are unaffected
+    _, other = app["keys"].create("bob", requests_per_hour=2)
+    resp = await client.post(
+        "/v1/chat/completions",
+        json=chat_payload(),
+        headers={"Authorization": f"Bearer {other}"},
+    )
+    assert resp.status == 200
+    resp = await client.post(
+        "/v1/chat/completions",
+        json=chat_payload(),
+        headers={"Authorization": "Bearer mkey"},
+    )
+    assert resp.status == 200
+
+
+async def test_user_priority_and_cap(app_env):
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+    _, key = app["keys"].create("alice", priority=7, max_priority=8)
+    h = {"Authorization": f"Bearer {key}"}
+
+    resp = await client.post("/v1/chat/completions", json=chat_payload(), headers=h)
+    assert resp.status == 200
+    jobs = [j for j in app["queue"].all_jobs() if j.user == "alice"]
+    assert jobs[-1].priority == 7  # key default applies
+
+    resp = await client.post(
+        "/v1/chat/completions", json=chat_payload(), headers={**h, "X-Priority": "10"}
+    )
+    assert resp.status == 200
+    jobs = [j for j in app["queue"].all_jobs() if j.user == "alice"]
+    assert jobs[-1].priority == 8  # header clamped to the key's max
+
+
+async def test_tokens_per_day_limit(app_env):
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+    _, key = app["keys"].create("alice", tokens_per_day=10)
+    h = {"Authorization": f"Bearer {key}"}
+
+    # pre-check passes (estimate ~4 tokens < 10); the mock then reports 100+
+    resp = await client.post("/v1/chat/completions", json=chat_payload(), headers=h)
+    assert resp.status == 200
+    # usage (100 prompt + 6 completion) now exceeds the 10/day budget
+    resp = await client.post("/v1/chat/completions", json=chat_payload(), headers=h)
+    assert resp.status == 429
+    assert (await resp.json())["error"]["type"] == "rate_limit_exceeded"

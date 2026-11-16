@@ -58,6 +58,16 @@ class UsageConfig:
 
 
 @dataclass
+class UsersConfig:
+    """Phase 2 defaults for newly created user keys (0 = unlimited)."""
+
+    default_priority: int = 3
+    default_max_priority: int = 10
+    default_requests_per_hour: int = 0
+    default_tokens_per_day: int = 0
+
+
+@dataclass
 class TokenizerConfig:
     url: str = "https://huggingface.co/Qwen/Qwen3-27B/resolve/main/tokenizer.json"
 
@@ -69,6 +79,7 @@ class Config:
     power: PowerConfig
     scheduler: SchedulerConfig
     usage: UsageConfig
+    users: UsersConfig
     tokenizer: TokenizerConfig
 
     @classmethod
@@ -79,6 +90,7 @@ class Config:
             PowerConfig(),
             SchedulerConfig(),
             UsageConfig(),
+            UsersConfig(),
             TokenizerConfig(),
         )
 
@@ -104,6 +116,7 @@ class Config:
             "power": cfg.power,
             "scheduler": cfg.scheduler,
             "usage": cfg.usage,
+            "users": cfg.users,
             "tokenizer": cfg.tokenizer,
         }
         for section, value in raw.items():
@@ -130,6 +143,14 @@ class Config:
             raise ConfigError("scheduler.conv_state_max must be >= 1")
         if not 1 <= self.proxy.listen_port <= 65535:
             raise ConfigError("proxy.listen_port out of range")
+        if not 0 <= self.users.default_priority <= 10:
+            raise ConfigError("users.default_priority must be 0-10")
+        if not 0 <= self.users.default_max_priority <= 10:
+            raise ConfigError("users.default_max_priority must be 0-10")
+        if self.users.default_requests_per_hour < 0:
+            raise ConfigError("users.default_requests_per_hour must be >= 0")
+        if self.users.default_tokens_per_day < 0:
+            raise ConfigError("users.default_tokens_per_day must be >= 0")
         if self.llm.boot_timeout_s <= 0:
             raise ConfigError("llm.boot_timeout_s must be > 0")
         if self.power.wol_mac:

@@ -81,3 +81,10 @@ class UsageTracker:
     @property
     def last_flush(self) -> float:
         return self._last_flush
+
+    def today_total(self, user: str) -> int:
+        """Prompt + completion tokens recorded for `user` today."""
+        row = self._data.get(user, {}).get(date.today().isoformat())
+        if row is None:
+            return 0
+        return int(row.get("prompt", 0)) + int(row.get("completion", 0))

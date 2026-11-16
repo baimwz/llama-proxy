@@ -40,6 +40,14 @@ conv_state_max = 128            # LRU cap for conversation states
 data_dir = "./data"             # only periodic usage flushes land here
 flush_interval_s = 60
 
+[users]
+# Defaults for newly created user keys (llama-proxy keys add ... / POST /admin/keys).
+# 0 = unlimited. Existing keys keep their own values.
+default_priority = 3            # used when the request has no X-Priority header
+default_max_priority = 10       # ceiling for the X-Priority header (0-10)
+default_requests_per_hour = 0
+default_tokens_per_day = 0
+
 [tokenizer]
 # Local token counting (downloaded once, cached in data_dir).
 url = "https://huggingface.co/Qwen/Qwen3-27B/resolve/main/tokenizer.json"

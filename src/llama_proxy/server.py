@@ -8,11 +8,15 @@ from pathlib import Path
 from aiohttp import web
 
 from . import __version__
+from .auth import Auth
 from .config import Config
 from .conversation import ConversationTracker
+from .keys import KeyStore
 from .llmclient import LLMClient
 from .metrics import Metrics
 from .power import PowerManager
+from .ratelimit import RateLimiter
+from .routes_admin import setup as setup_admin
 from .routes_openai import setup as setup_openai
 from .routes_ops import setup as setup_ops
 from .scheduler import Scheduler
@@ -40,6 +44,15 @@ def create_app(cfg: Config) -> web.Application:
     app["power"] = PowerManager(cfg, app["llm"].health, app["tracker"], metrics)
     app["queue"] = JobQueue()
     app["usage"] = UsageTracker(cfg.usage.data_dir, cfg.usage.flush_interval_s)
+    app["keys"] = KeyStore(
+        Path(cfg.usage.data_dir) / "keys.json",
+        default_priority=cfg.users.default_priority,
+        default_max_priority=cfg.users.default_max_priority,
+        default_requests_per_hour=cfg.users.default_requests_per_hour,
+        default_tokens_per_day=cfg.users.default_tokens_per_day,
+    )
+    app["limiter"] = RateLimiter()
+    app["auth"] = Auth(app["keys"], app["limiter"], app["usage"])
     app["scheduler"] = Scheduler(
         cfg, app["queue"], app["llm"], app["power"], app["tracker"],
         app["counter"], app["usage"], metrics,
@@ -88,6 +101,7 @@ def create_app(cfg: Config) -> web.Application:
 
     setup_openai(app)
     setup_ops(app)
+    setup_admin(app)
     return app
 
 

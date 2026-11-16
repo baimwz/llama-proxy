@@ -52,7 +52,17 @@ and be **woken on demand**.
   - queue order: `X-Priority` header (0–10) desc, then FIFO
 - **Monitoring** – Prometheus metrics at `/metrics`, live dashboard at `/`,
   usage accounting per day (flushed to one JSON file every 60 s)
-- **Auth** – single shared API key (Bearer), required in production
+- **Auth & multi-user (phase 2)**
+  - per-user API keys (Bearer), stored only as salted SHA-256 hashes – the
+    plaintext key is shown exactly once, at creation
+  - per-user **default priority** + a ceiling for the `X-Priority` header
+  - per-user **rate limits**: `requests_per_hour` (sliding window) and
+    `tokens_per_day` (pre-checked against usage); violations return `429` with
+    a `Retry-After` header
+  - per-user **usage stats** (prompt / completion tokens, request count)
+  - admin CLI + admin API to manage keys while the proxy keeps running
+    (the key file is hot-reloaded on change)
+  - a master key (admin) plus "open dev mode" when no keys are configured at all
 
 ## Endpoints
 
@@ -67,6 +77,11 @@ and be **woken on demand**.
 | GET    | `/server`           | LLM server state, idle time, queue sizes         |
 | GET    | `/metrics`          | Prometheus text format                           |
 | GET    | `/` or `/ui`        | small auto-refreshing HTML dashboard             |
+| POST   | `/admin/keys`       | **master key** – create a user key (returns the plaintext once) |
+| GET    | `/admin/keys`       | **master key** – list all users                  |
+| PATCH  | `/admin/keys/{name}`| **master key** – update limits / priority / disable |
+| DELETE | `/admin/keys/{name}`| **master key** – remove a user                   |
+| GET    | `/admin/usage`      | **master key** – per-user totals (`?days=N`)     |
 
 ## Quick start (development)
 
@@ -164,6 +179,61 @@ curl -N http://proxy:8080/v1/chat/completions \
 curl -s http://proxy:8080/v1/jobs/<id>
 ```
 
+## Multi-user, priorities & rate limits (phase 2)
+
+Every client gets its own key. The key is shown **once** when created; only a
+salted hash is stored (in `data/keys.json`, git-ignored). No database.
+
+### Create and manage keys (CLI)
+
+```bash
+# create a key (prints the plaintext exactly once)
+.venv/bin/llama-proxy keys add alice --config config.toml \
+    --priority 5 --max-priority 8 \
+    --requests-per-hour 60 --tokens-per-day 1000000
+
+.venv/bin/llama-proxy keys list    --config config.toml
+.venv/bin/llama-proxy keys disable alice --config config.toml
+.venv/bin/llama-proxy keys enable  alice --config config.toml
+.venv/bin/llama-proxy keys remove  alice --config config.toml
+
+# per-user usage (prompt / completion tokens, requests)
+.venv/bin/llama-proxy usage --config config.toml --days 7 [--user alice]
+```
+
+The running proxy **hot-reloads** `data/keys.json` whenever the file changes
+(mtime + size), so CLI edits take effect immediately – no restart.
+
+### Per-user behaviour
+
+- **Priority** – a request's priority is its `X-Priority` header (0–10) when
+  present, otherwise the key's default `priority`. For user keys the header is
+  clamped to the key's `max_priority`, so a key cannot escalate above its ceiling.
+- **Rate limits** – `requests_per_hour` uses a sliding one-hour window
+  (RAM-only, reset on proxy restart); `tokens_per_day` is pre-checked against
+  that user's usage before a job is queued. A violation returns `429` with an
+  OpenAI-style error body and a `Retry-After` header.
+- **Master key** – `proxy.master_api_key` is the admin key: unlimited limits,
+  and the only key accepted by the `/admin/*` endpoints.
+- **Open dev mode** – only when *no* master key **and** no user keys are
+  configured at all; every request then runs as the `default` user.
+
+### Admin API (master key)
+
+```bash
+# create a key
+curl -s http://proxy:8080/admin/keys \
+  -H 'Authorization: Bearer MASTER_KEY' -H 'Content-Type: application/json' \
+  -d '{"name":"bob","priority":4,"requests_per_hour":30}'
+# -> 201, body contains the plaintext key (shown once)
+
+curl -s http://proxy:8080/admin/keys -H 'Authorization: Bearer MASTER_KEY'
+curl -s -X PATCH http://proxy:8080/admin/keys/bob \
+  -H 'Authorization: Bearer MASTER_KEY' -d '{"disabled":true}'
+curl -s -X DELETE http://proxy:8080/admin/keys/bob -H 'Authorization: Bearer MASTER_KEY'
+curl -s 'http://proxy:8080/admin/usage?days=7' -H 'Authorization: Bearer MASTER_KEY'
+```
+
 ## How the sleep/wake cycle works
 
 ```
@@ -228,6 +298,10 @@ Key settings:
 | `scheduler.large_exclusive` | true | Large blocks everything |
 | `scheduler.classification` | delta | `delta` or `total` |
 | `usage.flush_interval_s` | 60 | usage file flush period |
+| `users.default_priority` | 3 | default priority for new keys (0–10) |
+| `users.default_max_priority` | 10 | `X-Priority` ceiling for new keys |
+| `users.default_requests_per_hour` | 0 | per-hour limit for new keys (0 = unlimited) |
+| `users.default_tokens_per_day` | 0 | per-day token limit for new keys (0 = unlimited) |
 
 ## Monitoring
 
@@ -248,9 +322,15 @@ Selected metrics: `llama_proxy_state`, `llama_proxy_queue_size`,
 
 ## Security notes
 
-- Always set `proxy.master_api_key` (the API is open without it – dev only).
-- Secrets live in `config.toml` (git-ignored) and the SSH key file – never in
-  the repository.
+- Set `proxy.master_api_key` and create per-user keys. The API is only open
+  (dev mode) when *no* master key and *no* user keys exist.
+- User keys are stored **only** as salted SHA-256 hashes in `data/keys.json`;
+  the plaintext key is shown exactly once and cannot be recovered. Revoke by
+  disabling or removing the key, or by deleting/rotating the file + salt.
+- Secrets live in `config.toml`, `data/keys.json` and the SSH key file – all
+  git-ignored, never in the repository.
+- `data/keys.json` and `data/usage.json` should be read-restricted
+  (`chmod 600`); they are the only long-lived secrets/statistics on disk.
 - Tailscale/LAN is the intended perimeter; no public TLS is required, but add
   one if you expose the port publicly.
 - The `proxy` SSH user on the Proxmox host can only run `poweroff`.
@@ -276,7 +356,7 @@ Selected metrics: `llama_proxy_state`, `llama_proxy_queue_size`,
 ## Roadmap
 
 - [x] Phase 1: proxy + queue + power management + scheduler + monitoring
-- [ ] Phase 2: per-user API keys, priorities, rate limits, usage per user
+- [x] Phase 2: per-user API keys, priorities, rate limits, usage per user
 - [ ] Phase 3 (optional): Grafana dashboards, scheduled off-windows, job cancel
 
 ## License

@@ -84,7 +84,7 @@ class Scheduler:
     # -- public API ---------------------------------------------------------
 
     def enqueue(self, job: Job) -> Job:
-        total = self._counter.count(job.prompt_text)
+        total = job.prompt_tokens_est or self._counter.count(job.prompt_text)
         job.prompt_tokens_est = total
         if self._cfg.scheduler.classification == "delta" and self._power.state is ProxyState.READY:
             effective = self._tracker.delta_for(job.prompt_text, total, self._counter)

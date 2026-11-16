@@ -4,11 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import secrets
 import time
 
 from aiohttp import web
 
+from .auth import Identity
 from .power import ProxyState
 from .render import render_prompt
 from .state import Job, JobState
@@ -18,28 +18,49 @@ log = logging.getLogger("llama_proxy.routes")
 PRIORITY_HEADER = "x-priority"
 
 
-def auth_ok(request: web.Request, expected: str) -> bool:
-    if not expected:
-        return True  # no key configured -> open (documented as dev-only)
-    header = request.headers.get("Authorization", "")
-    token = header[7:] if header.startswith("Bearer ") else header
-    return bool(token) and secrets.compare_digest(token, expected)
-
-
 def err(message: str, status: int, **extra) -> web.Response:
     body = {"error": {"message": message, "type": "proxy_error", **extra}}
     return web.json_response(body, status=status)
 
 
-def parse_priority(request: web.Request) -> int:
+def rate_limited(retry_after: int) -> web.Response:
+    resp = web.json_response(
+        {
+            "error": {
+                "message": f"rate limit exceeded - retry in about {retry_after}s",
+                "type": "rate_limit_exceeded",
+                "code": "rate_limit_exceeded",
+            }
+        },
+        status=429,
+    )
+    resp.headers["Retry-After"] = str(retry_after)
+    return resp
+
+
+def _resolve(request: web.Request) -> Identity | None:
+    return request.app["auth"].resolve(request, request.app["cfg"].proxy.master_api_key)
+
+
+def parse_priority(request: web.Request, ident: Identity) -> int:
+    """X-Priority (0-10) if present, else the user's default priority.
+
+    For user keys the header value is capped at the key's max_priority;
+    without a header the key's own priority applies.
+    """
     raw = request.headers.get(PRIORITY_HEADER, "")
-    try:
-        return max(0, min(10, int(raw)))
-    except (TypeError, ValueError):
-        return 0
+    default, cap = 0, 10
+    if ident.key is not None:
+        default, cap = ident.key.priority, ident.key.max_priority
+    if raw:
+        try:
+            return max(0, min(cap, int(raw)))
+        except (TypeError, ValueError):
+            return default
+    return default
 
 
-def make_job(request: web.Request, kind: str, payload: dict) -> Job:
+def make_job(request: web.Request, kind: str, payload: dict, ident: Identity) -> Job:
     cfg = request.app["cfg"]
     if "model" not in payload or not payload.get("model"):
         payload["model"] = cfg.llm.model_name
@@ -49,8 +70,8 @@ def make_job(request: web.Request, kind: str, payload: dict) -> Job:
         kind=kind,
         payload=payload,
         prompt_text=prompt_text,
-        user="default",  # phase 2: resolved from API key
-        priority=parse_priority(request),
+        user=ident.name,
+        priority=parse_priority(request, ident),
         is_stream=bool(payload.get("stream")),
     )
 
@@ -78,7 +99,8 @@ async def completions(request: web.Request) -> web.StreamResponse:
 
 async def _handle(request: web.Request, kind: str) -> web.StreamResponse:
     app = request.app
-    if not auth_ok(request, app["cfg"].proxy.master_api_key):
+    ident = _resolve(request)
+    if ident is None:
         return err("invalid or missing API key", 401)
     try:
         payload = await request.json()
@@ -87,7 +109,12 @@ async def _handle(request: web.Request, kind: str) -> web.StreamResponse:
     if not isinstance(payload, dict):
         return err("body must be a JSON object", 400)
 
-    job = make_job(request, kind, payload)
+    job = make_job(request, kind, payload, ident)
+    job.prompt_tokens_est = app["counter"].count(job.prompt_text)
+    violated, retry_after = app["auth"].rate_limit_error(ident, job.prompt_tokens_est)
+    if violated:
+        return rate_limited(retry_after)
+
     app["power"].note_activity()
     app["scheduler"].enqueue(job)
 
@@ -112,6 +139,8 @@ async def _handle(request: web.Request, kind: str) -> web.StreamResponse:
 
 
 async def models(request: web.Request) -> web.Response:
+    if _resolve(request) is None:
+        return err("invalid or missing API key", 401)
     name = request.app["cfg"].llm.model_name
     return web.json_response(
         {
@@ -122,6 +151,8 @@ async def models(request: web.Request) -> web.Response:
 
 
 async def get_job(request: web.Request) -> web.Response:
+    if _resolve(request) is None:
+        return err("invalid or missing API key", 401)
     job = request.app["queue"].get(request.match_info["job_id"])
     if job is None:
         return err("job not found", 404)
@@ -129,6 +160,8 @@ async def get_job(request: web.Request) -> web.Response:
 
 
 async def queue_view(request: web.Request) -> web.Response:
+    if _resolve(request) is None:
+        return err("invalid or missing API key", 401)
     app = request.app
     queue = app["queue"]
     return web.json_response(

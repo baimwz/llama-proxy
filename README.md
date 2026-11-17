@@ -202,19 +202,26 @@ adapter on a USB 3.0 port.
 llama-proxy shuts the host down after the idle timeout – but if the Pi itself
 is down, the server would keep burning standby power.
 `scripts/proxmox-idle-poweroff.sh` installs a small Proxmox daemon that
-powers the host off when the LLM container shows **no network activity** for
-N hours (default **2 h** – a fallback, not the primary path). It works
-without llama.cpp's metrics endpoints: it just watches the LXC's rx/tx byte
-counters.
+powers the host off when the LLM has been idle for N hours (default
+**2 h** – a fallback, not the primary path). It runs on the host (an LXC
+container cannot power off the host) and decides "idle" from two signals –
+either one resets the timer:
+
+- **GPU power draw** (primary): `nvidia-smi` reading, taken on the host or
+  via `pct exec` inside the LXC. Draw ≥ threshold (default **100 W**) means
+  a job is running – this also covers long non-streaming generations that
+  produce no network traffic.
+- **LXC network counters** (fallback): rx/tx bytes moving ⇒ request traffic.
 
 ```bash
-sudo scripts/proxmox-idle-poweroff.sh show             # config + current LXC activity
+sudo scripts/proxmox-idle-poweroff.sh show             # config + current signals
 sudo scripts/proxmox-idle-poweroff.sh install          # stable path + systemd unit (idempotent, backs up)
 sudo scripts/proxmox-idle-poweroff.sh uninstall        # revert
 ```
 
-Options: `--lxc-id 100` (default), `--lxc-iface eth0` (default),
-`--timeout 7200` (default), `--interval 30`, `--probe CMD` (testing).
+Options: `--lxc-id 100`, `--lxc-iface eth0`, `--timeout 7200`,
+`--interval 30`, `--gpu-threshold 100`, `--no-gpu` (network signal only),
+`--probe CMD` / `--gpu-probe CMD` (testing overrides).
 
 ### Client examples
 

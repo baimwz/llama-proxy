@@ -134,8 +134,16 @@ llama ALL=(root) NOPASSWD: /usr/sbin/poweroff
 
 If the Pi dies, the proxy cannot initiate the shutdown. A small Proxmox
 daemon (`scripts/proxmox-idle-poweroff.sh`) powers the host off after
-**2 h** without LLM activity (LXC network counters; no llama.cpp metrics
-dependency):
+**2 h** without LLM activity. It must run on the **host** — an LXC cannot
+power off the host (a container's `poweroff` only stops the container).
+"Idle" is decided from two signals, either one resets the timer:
+
+- **GPU power draw** (primary): `nvidia-smi` power reading, on the host
+  (driver there, LXC shares `/dev/nvidia*`) or via `pct exec` inside the
+  LXC (GPU passed through). Draw ≥ **100 W** ⇒ a job is running. No
+  guessing: a busy GPU means real work, even for long non-streaming
+  generations with no traffic.
+- **LXC network counters** (fallback): rx/tx bytes moving ⇒ requests.
 
 ```bash
 sudo scripts/proxmox-idle-poweroff.sh show
@@ -143,7 +151,9 @@ sudo scripts/proxmox-idle-poweroff.sh install
 ```
 
 The proxy (20 min idle) remains the primary, precise path; the daemon is a
-coarse fallback that can never misfire mid-job (2 h window).
+coarse fallback that can never misfire mid-job (2 h window). Check the
+card's actual idle draw once with `nvidia-smi` — if it sits higher than
+~60 W, raise `--gpu-threshold`.
 
 ## Gotchas (learned the hard way)
 

@@ -55,6 +55,9 @@ class LLMClient:
         usage = data.get("usage") or {}
         job.prompt_tokens_actual = usage.get("prompt_tokens")
         job.completion_tokens_actual = usage.get("completion_tokens")
+        job.cached_tokens_actual = (usage.get("prompt_tokens_details") or {}).get(
+            "cached_tokens"
+        )
         return data
 
     @asynccontextmanager

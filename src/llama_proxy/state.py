@@ -49,6 +49,7 @@ class Job:
     result: dict | None = None
     prompt_tokens_actual: int | None = None
     completion_tokens_actual: int | None = None
+    cached_tokens_actual: int | None = None  # prompt tokens served from KV cache (subset of prompt)
     _seq: int = field(default=0, compare=False, repr=False)
 
     def __post_init__(self) -> None:

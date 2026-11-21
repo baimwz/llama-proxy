@@ -36,13 +36,21 @@ class UsageTracker:
             log.warning("could not load usage data: %s", exc)
 
     def record(
-        self, user: str, prompt_tokens: int, completion_tokens: int, requests: int = 1
+        self,
+        user: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        requests: int = 1,
+        cached_tokens: int = 0,
     ) -> None:
         day = date.today().isoformat()
         per_user = self._data.setdefault(user, {})
-        row = per_user.setdefault(day, {"prompt": 0, "completion": 0, "requests": 0})
+        row = per_user.setdefault(
+            day, {"prompt": 0, "completion": 0, "cached": 0, "requests": 0}
+        )
         row["prompt"] += int(prompt_tokens)
         row["completion"] += int(completion_tokens)
+        row["cached"] += int(cached_tokens)
         row["requests"] += int(requests)
 
     def flush(self) -> None:
@@ -66,7 +74,7 @@ class UsageTracker:
         cutoff = datetime.combine(date.today(), datetime.min.time()).timestamp() - days * 86400
         out: dict[str, dict[str, int]] = {}
         for user, per_day in self._data.items():
-            agg = {"prompt": 0, "completion": 0, "requests": 0}
+            agg = {"prompt": 0, "completion": 0, "cached": 0, "requests": 0}
             for day, row in per_day.items():
                 try:
                     ts = datetime.fromisoformat(day).timestamp()

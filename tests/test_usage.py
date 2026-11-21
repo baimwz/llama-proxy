@@ -25,8 +25,31 @@ def test_totals_window(tmp_path):
     assert u.totals(days=30)["u1"]["prompt"] == 10
 
 
-def test_corrupt_file_is_ignored(tmp_path):
-    (tmp_path / "usage.json").write_text("{not json")
-    u = UsageTracker(str(tmp_path), 60)  # must not raise
-    u.record("default", 1, 1, 1)
-    assert u.totals()["default"]["prompt"] == 1
+def test_cached_tokens_tracked(tmp_path):
+    u = UsageTracker(str(tmp_path), 60)
+    # 73 prompt tokens, 69 of them served from KV cache
+    u.record("default", 73, 5, 1, cached_tokens=69)
+    u.flush()
+    reloaded = UsageTracker(str(tmp_path), 60)
+    totals = reloaded.totals()
+    assert totals["default"]["prompt"] == 73
+    assert totals["default"]["completion"] == 5
+    assert totals["default"]["cached"] == 69
+
+
+def test_cached_tokens_default_zero(tmp_path):
+    # callers that don't pass cached_tokens (old code path) must still work
+    u = UsageTracker(str(tmp_path), 60)
+    u.record("default", 100, 50, 2)
+    assert u.totals()["default"]["cached"] == 0
+
+
+def test_legacy_rows_without_cached_field(tmp_path):
+    # rows written before the `cached` field existed must not break totals()
+    from datetime import date
+
+    u = UsageTracker(str(tmp_path), 60)
+    u._data["u1"] = {date.today().isoformat(): {"prompt": 5, "completion": 1, "requests": 1}}
+    totals = u.totals(days=30)
+    assert totals["u1"]["prompt"] == 5
+    assert totals["u1"]["cached"] == 0

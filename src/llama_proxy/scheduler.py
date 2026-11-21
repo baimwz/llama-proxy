@@ -216,12 +216,18 @@ class Scheduler:
         job.completion_tokens_actual = usage.get("completion_tokens")
         if job.completion_tokens_actual is None:
             job.completion_tokens_actual = self._counter.count(acc.content) if acc.content else 0
+        job.cached_tokens_actual = (usage.get("prompt_tokens_details") or {}).get(
+            "cached_tokens"
+        )
         job.result = {
             "role": "assistant",
             "content": acc.content,
             "usage": {
                 "prompt_tokens": job.prompt_tokens_actual,
                 "completion_tokens": job.completion_tokens_actual,
+                "prompt_tokens_details": {
+                    "cached_tokens": job.cached_tokens_actual or 0,
+                },
             },
         }
         await job.put_sentinel(END)
@@ -250,6 +256,9 @@ class Scheduler:
         if job.state is JobState.DONE:
             p_tok = job.prompt_tokens_actual or 0
             c_tok = job.completion_tokens_actual or 0
+            cached_tok = job.cached_tokens_actual or 0
             m.tokens_total.inc(kind="prompt", amount=float(p_tok), user=job.user)
             m.tokens_total.inc(kind="completion", amount=float(c_tok), user=job.user)
-            self._usage.record(job.user, p_tok, c_tok)
+            if cached_tok:
+                m.tokens_total.inc(kind="cached", amount=float(cached_tok), user=job.user)
+            self._usage.record(job.user, p_tok, c_tok, cached_tokens=cached_tok)

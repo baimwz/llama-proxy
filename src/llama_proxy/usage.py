@@ -15,6 +15,16 @@ from pathlib import Path
 
 log = logging.getLogger("llama_proxy.usage")
 
+# Every per-day row carries exactly these counters. Newer versions may add
+# fields (e.g. ``cached``); rows written by older versions lack them.
+_ROW_FIELDS = ("prompt", "completion", "cached", "requests")
+
+
+def _ensure_row_fields(row: dict) -> None:
+    """Backfill any counter fields a per-day row is missing (legacy rows)."""
+    for field in _ROW_FIELDS:
+        row.setdefault(field, 0)
+
 
 class UsageTracker:
     def __init__(self, data_dir: str, flush_interval_s: float) -> None:
@@ -32,6 +42,11 @@ class UsageTracker:
                     loaded = json.load(fh)
                 if isinstance(loaded, dict):
                     self._data = loaded
+                    for per_day in self._data.values():
+                        if isinstance(per_day, dict):
+                            for row in per_day.values():
+                                if isinstance(row, dict):
+                                    _ensure_row_fields(row)
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("could not load usage data: %s", exc)
 
@@ -45,9 +60,8 @@ class UsageTracker:
     ) -> None:
         day = date.today().isoformat()
         per_user = self._data.setdefault(user, {})
-        row = per_user.setdefault(
-            day, {"prompt": 0, "completion": 0, "cached": 0, "requests": 0}
-        )
+        row = per_user.setdefault(day, {k: 0 for k in _ROW_FIELDS})
+        _ensure_row_fields(row)
         row["prompt"] += int(prompt_tokens)
         row["completion"] += int(completion_tokens)
         row["cached"] += int(cached_tokens)

@@ -53,3 +53,37 @@ def test_legacy_rows_without_cached_field(tmp_path):
     totals = u.totals(days=30)
     assert totals["u1"]["prompt"] == 5
     assert totals["u1"]["cached"] == 0
+
+
+def test_record_on_legacy_row_backfills_cached(tmp_path):
+    # Regression: a row written by an older version has no "cached" key.
+    # record() used to raise KeyError('cached') there, silently dropping the
+    # request after the client already received its response. It must now
+    # backfill the field and record every counter.
+    u = UsageTracker(str(tmp_path), 60)
+    day = date.today().isoformat()
+    u._data["u1"] = {day: {"prompt": 5, "completion": 1, "requests": 1}}
+    u.record("u1", 10, 4, 1, cached_tokens=6)  # must not raise
+    row = u._data["u1"][day]
+    assert row["prompt"] == 15
+    assert row["completion"] == 5
+    assert row["cached"] == 6
+    assert row["requests"] == 2
+    totals = u.totals(days=30)
+    assert totals["u1"]["cached"] == 6
+    assert totals["u1"]["requests"] == 2
+
+
+def test_reload_backfills_legacy_rows(tmp_path):
+    # A usage.json written by an older version (no "cached" key) must load
+    # cleanly and record() on its rows must work.
+    (tmp_path / "usage.json").write_text(
+        '{"master": {"2026-11-21": {"prompt": 4471, "completion": 698, "requests": 9}}}'
+    )
+    u = UsageTracker(str(tmp_path), 60)
+    day = date.today().isoformat()
+    u.record("master", 71, 4, 1, cached_tokens=42)  # must not raise
+    row = u._data["master"][day]
+    assert row["cached"] == 42
+    assert row["requests"] == 10  # 9 (legacy) + 1
+    assert row["prompt"] == 4471 + 71

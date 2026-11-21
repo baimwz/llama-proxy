@@ -51,7 +51,9 @@ class TokenCounter:
         try:
             import httpx
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            # follow_redirects: HuggingFace `resolve/...` URLs 302-redirect to a
+            # CDN; without this the client reads the redirect body, not the file.
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
                 resp = await client.get(self._url)
                 resp.raise_for_status()
             text = resp.text

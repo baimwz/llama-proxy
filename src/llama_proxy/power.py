@@ -221,8 +221,14 @@ class PowerManager:
         t0 = time.monotonic()
         self.state = ProxyState.WAKING
         if self._power_on is not None:
+            log.info(
+                "sending WoL magic packet to %s (broadcast %s)",
+                self._cfg.power.wol_mac,
+                self._cfg.power.wol_bcast or "255.255.255.255",
+            )
             try:
                 await self._power_on()
+                log.info("WoL packet sent")
             except Exception as exc:
                 self.state = ProxyState.OFF
                 self._metrics.wake_failures_total.inc()

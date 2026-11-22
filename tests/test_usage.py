@@ -77,11 +77,11 @@ def test_record_on_legacy_row_backfills_cached(tmp_path):
 def test_reload_backfills_legacy_rows(tmp_path):
     # A usage.json written by an older version (no "cached" key) must load
     # cleanly and record() on its rows must work.
+    day = date.today().isoformat()
     (tmp_path / "usage.json").write_text(
-        '{"master": {"2026-11-21": {"prompt": 4471, "completion": 698, "requests": 9}}}'
+        '{"master": {"%s": {"prompt": 4471, "completion": 698, "requests": 9}}}' % day
     )
     u = UsageTracker(str(tmp_path), 60)
-    day = date.today().isoformat()
     u.record("master", 71, 4, 1, cached_tokens=42)  # must not raise
     row = u._data["master"][day]
     assert row["cached"] == 42

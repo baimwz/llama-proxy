@@ -45,6 +45,11 @@ class PowerConfig:
     pre_shutdown_command: str = ""
     wol_mac: str = ""
     wol_bcast: str = ""  # empty = 255.255.255.255 (limited broadcast, same L2)
+    # Seconds between WoL re-sends while waiting for the host to come up.
+    # The host may still be finishing its shutdown when the first packet goes
+    # out and only reach S5 later, so a single early packet can be missed.
+    # Set to 0 to send exactly once (old behaviour).
+    wol_resend_interval_s: float = 15.0
     shutdown_verify_timeout_s: float = 30.0
 
 

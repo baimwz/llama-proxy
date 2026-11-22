@@ -220,23 +220,44 @@ class PowerManager:
     async def _do_wake(self) -> None:
         t0 = time.monotonic()
         self.state = ProxyState.WAKING
-        if self._power_on is not None:
-            log.info(
-                "sending WoL magic packet to %s (broadcast %s)",
-                self._cfg.power.wol_mac,
-                self._cfg.power.wol_bcast or "255.255.255.255",
-            )
-            try:
-                await self._power_on()
-                log.info("WoL packet sent")
-            except Exception as exc:
-                self.state = ProxyState.OFF
-                self._metrics.wake_failures_total.inc()
-                raise PowerError(f"power-on failed: {exc}") from exc
-        else:
+        if self._power_on is None:
             log.info("no power-on backend; polling health only")
+        # Re-send WoL periodically while waiting for the host to come up:
+        # the host may still be finishing its shutdown when the first packet
+        # goes out and only reach S5 (fully off) later - a single early packet
+        # would then be missed. Re-sends are harmless (idempotent).
+        resend_s = self._cfg.power.wol_resend_interval_s
+        next_wol = 0.0
+        wol_sent = False
         deadline = time.monotonic() + self._cfg.llm.boot_timeout_s
         while time.monotonic() < deadline:
+            if self._power_on is not None:
+                due = (not wol_sent) if resend_s <= 0 else time.monotonic() >= next_wol
+            else:
+                due = False
+            if due:
+                try:
+                    await self._power_on()
+                except Exception as exc:  # noqa: BLE001
+                    if not wol_sent:
+                        self.state = ProxyState.OFF
+                        self._metrics.wake_failures_total.inc()
+                        raise PowerError(f"power-on failed: {exc}") from exc
+                    log.warning("WoL re-send failed (continuing): %s", exc)
+                else:
+                    if wol_sent:
+                        log.info("WoL magic packet re-sent")
+                    else:
+                        log.info(
+                            "WoL magic packet sent to %s (broadcast %s)",
+                            self._cfg.power.wol_mac,
+                            self._cfg.power.wol_bcast or "255.255.255.255",
+                        )
+                    wol_sent = True
+                if resend_s > 0:
+                    next_wol = time.monotonic() + resend_s
+                else:
+                    next_wol = float("inf")  # single send only
             try:
                 if await self._health():
                     self._tracker.invalidate()

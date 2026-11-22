@@ -82,6 +82,87 @@ async def test_concurrent_wake_single_poweron(tmp_path):
     assert pm.state is ProxyState.READY
 
 
+async def test_wol_resends_while_booting(tmp_path):
+    # The host may still be finishing its shutdown when the first WoL packet
+    # goes out and only reach S5 later. WoL must be re-sent during the wake
+    # window so a late-reaching host still gets woken.
+    fake = FakeLLM(ready_after=50)
+    pm = make_pm(
+        tmp_path, fake,
+        power={"wol_resend_interval_s": 0.05},
+        llm={"health_interval_s": 0.01, "boot_timeout_s": 5},
+    )
+    on_calls: list[int] = []
+
+    async def power_on() -> None:
+        on_calls.append(1)
+
+    pm.set_backends(power_on=power_on)
+    pm.state = ProxyState.OFF
+    await pm.ensure_ready()
+    assert pm.state is ProxyState.READY
+    assert len(on_calls) >= 3  # initial send plus re-sends
+
+
+async def test_wol_single_send_when_resend_disabled(tmp_path):
+    fake = FakeLLM(ready_after=50)
+    pm = make_pm(
+        tmp_path, fake,
+        power={"wol_resend_interval_s": 0.0},
+        llm={"health_interval_s": 0.01, "boot_timeout_s": 5},
+    )
+    on_calls: list[int] = []
+
+    async def power_on() -> None:
+        on_calls.append(1)
+
+    pm.set_backends(power_on=power_on)
+    pm.state = ProxyState.OFF
+    await pm.ensure_ready()
+    assert pm.state is ProxyState.READY
+    assert len(on_calls) == 1  # resend disabled -> exactly one packet
+
+
+async def test_wol_resend_failure_not_fatal(tmp_path):
+    # A failing re-send must not abort the wake (the first packet already went
+    # out); only a failing FIRST send is fatal.
+    fake = FakeLLM(ready_after=50)
+    pm = make_pm(
+        tmp_path, fake,
+        power={"wol_resend_interval_s": 0.05},
+        llm={"health_interval_s": 0.01, "boot_timeout_s": 5},
+    )
+    calls = {"n": 0}
+
+    async def power_on() -> None:
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise OSError("no route to broadcast")
+
+    pm.set_backends(power_on=power_on)
+    pm.state = ProxyState.OFF
+    await pm.ensure_ready()
+    assert pm.state is ProxyState.READY
+
+
+async def test_wol_first_send_failure_raises(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(
+        tmp_path, fake,
+        power={"wol_resend_interval_s": 0.0},
+        llm={"health_interval_s": 0.01, "boot_timeout_s": 1},
+    )
+
+    async def boom() -> None:
+        raise OSError("socket error")
+
+    pm.set_backends(power_on=boom)
+    pm.state = ProxyState.OFF
+    with pytest.raises(PowerError):
+        await pm.ensure_ready()
+    assert pm.state is ProxyState.OFF
+
+
 async def test_tracker_invalidate_on_wake(tmp_path):
     fake = FakeLLM(ready_after=1)
     cfg = Config.defaults()

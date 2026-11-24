@@ -17,7 +17,7 @@ log = logging.getLogger("llama_proxy.usage")
 
 # Every per-day row carries exactly these counters. Newer versions may add
 # fields (e.g. ``cached``); rows written by older versions lack them.
-_ROW_FIELDS = ("prompt", "completion", "cached", "requests")
+_ROW_FIELDS = ("prompt", "completion", "cached", "requests", "compute_seconds")
 
 
 def _ensure_row_fields(row: dict) -> None:
@@ -57,6 +57,7 @@ class UsageTracker:
         completion_tokens: int,
         requests: int = 1,
         cached_tokens: int = 0,
+        compute_seconds: float = 0.0,
     ) -> None:
         day = date.today().isoformat()
         per_user = self._data.setdefault(user, {})
@@ -66,6 +67,7 @@ class UsageTracker:
         row["completion"] += int(completion_tokens)
         row["cached"] += int(cached_tokens)
         row["requests"] += int(requests)
+        row["compute_seconds"] += float(compute_seconds)
 
     def flush(self) -> None:
         try:
@@ -84,21 +86,51 @@ class UsageTracker:
             await asyncio.to_thread(self.flush)
 
     def totals(self, days: int = 30) -> dict:
-        """Aggregated totals for the last N days (for /ui and future CLI)."""
+        """Aggregated totals for the last N days (for the web page / CLI)."""
         cutoff = datetime.combine(date.today(), datetime.min.time()).timestamp() - days * 86400
-        out: dict[str, dict[str, int]] = {}
+        out: dict[str, dict] = {}
         for user, per_day in self._data.items():
-            agg = {"prompt": 0, "completion": 0, "cached": 0, "requests": 0}
+            agg = {"prompt": 0, "completion": 0, "cached": 0, "requests": 0, "compute_seconds": 0.0}
             for day, row in per_day.items():
-                try:
-                    ts = datetime.fromisoformat(day).timestamp()
-                except ValueError:
-                    continue
-                if ts >= cutoff:
-                    for k in agg:
-                        agg[k] += int(row.get(k, 0))
+                if self._in_window(day, cutoff):
+                    agg["prompt"] += int(row.get("prompt", 0))
+                    agg["completion"] += int(row.get("completion", 0))
+                    agg["cached"] += int(row.get("cached", 0))
+                    agg["requests"] += int(row.get("requests", 0))
+                    agg["compute_seconds"] += float(row.get("compute_seconds", 0))
+            agg["compute_seconds"] = round(agg["compute_seconds"], 2)
             out[user] = agg
         return out
+
+    def daily(self, user: str | None = None, days: int = 30) -> dict:
+        """Per-day rows for the last N days, oldest first.
+
+        ``user`` selects one user; ``None`` returns every user. Each row has
+        the date plus the counters (compute_seconds rounded to 2 decimals).
+        """
+        cutoff = datetime.combine(date.today(), datetime.min.time()).timestamp() - days * 86400
+        users = [user] if user is not None else list(self._data.keys())
+        out: dict[str, list[dict]] = {}
+        for u in users:
+            rows: list[dict] = []
+            for day, row in self._data.get(u, {}).items():
+                if not self._in_window(day, cutoff):
+                    continue
+                r = {"day": day}
+                for k in _ROW_FIELDS:
+                    r[k] = row.get(k, 0)
+                r["compute_seconds"] = round(float(r.get("compute_seconds", 0)), 2)
+                rows.append(r)
+            rows.sort(key=lambda x: x["day"])
+            out[u] = rows
+        return out
+
+    @staticmethod
+    def _in_window(day: str, cutoff: float) -> bool:
+        try:
+            return datetime.fromisoformat(day).timestamp() >= cutoff
+        except ValueError:
+            return False
 
     @property
     def last_flush(self) -> float:

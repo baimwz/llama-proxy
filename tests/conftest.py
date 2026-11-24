@@ -54,6 +54,7 @@ class MockLLM:
                         "completion_tokens": len(MOCK_WORDS),
                         "total_tokens": 100 + len(MOCK_WORDS),
                     },
+                    "timings": {"prompt_ms": 100.0, "predicted_ms": 200.0},
                 }
                 await resp.write(f"data: {json.dumps(final)}\n\n".encode())
                 await resp.write(b"data: [DONE]\n\n")
@@ -75,6 +76,7 @@ class MockLLM:
                         "completion_tokens": len(MOCK_WORDS),
                         "total_tokens": 100 + len(MOCK_WORDS),
                     },
+                    "timings": {"prompt_ms": 100.0, "predicted_ms": 200.0},
                 }
             )
 

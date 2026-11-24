@@ -39,9 +39,13 @@ class Auth:
 
     def resolve(self, request: web.Request, master_key: str) -> Identity | None:
         """Return the caller's identity, or None when the key is invalid."""
+        token = token_from_header(request.headers.get("Authorization", ""))
+        return self.resolve_token(token, master_key)
+
+    def resolve_token(self, token: str, master_key: str) -> Identity | None:
+        """Resolve a raw bearer token to an identity (no request needed)."""
         if not self.auth_required(master_key):
             return Identity(name="default")  # dev mode: no keys configured at all
-        token = token_from_header(request.headers.get("Authorization", ""))
         if master_key and secrets.compare_digest(token, master_key):
             return Identity(name="master", master=True)
         user = self._keys.lookup(token)

@@ -19,6 +19,7 @@ from .ratelimit import RateLimiter
 from .routes_admin import setup as setup_admin
 from .routes_openai import setup as setup_openai
 from .routes_ops import setup as setup_ops
+from .routes_web import setup as setup_web
 from .scheduler import Scheduler
 from .state import JobQueue
 from .tokenizer import TokenCounter
@@ -102,6 +103,7 @@ def create_app(cfg: Config) -> web.Application:
     setup_openai(app)
     setup_ops(app)
     setup_admin(app)
+    setup_web(app)
     return app
 
 

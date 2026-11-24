@@ -18,6 +18,22 @@ class LLMError(RuntimeError):
     pass
 
 
+def compute_seconds_from_timings(timings) -> float | None:
+    """Turn llama.cpp ``timings`` (``prompt_ms`` + ``predicted_ms``) into seconds.
+
+    Returns ``None`` when no usable timings are present, so the caller can
+    fall back to the job duration.
+    """
+    if not isinstance(timings, dict):
+        return None
+    try:
+        prompt_ms = float(timings.get("prompt_ms", 0) or 0)
+        predicted_ms = float(timings.get("predicted_ms", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return (prompt_ms + predicted_ms) / 1000.0
+
+
 class LLMClient:
     def __init__(self, cfg: LlmConfig) -> None:
         headers = {"Content-Type": "application/json"}
@@ -58,6 +74,7 @@ class LLMClient:
         job.cached_tokens_actual = (usage.get("prompt_tokens_details") or {}).get(
             "cached_tokens"
         )
+        job.compute_seconds_actual = compute_seconds_from_timings(data.get("timings"))
         return data
 
     @asynccontextmanager

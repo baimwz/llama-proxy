@@ -95,5 +95,6 @@ def setup(app: web.Application) -> None:
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/server", server_state)
     app.router.add_get("/metrics", metrics)
-    app.router.add_get("/", ui)
+    # NOTE: "/" is the new personal usage page (routes_web); this ops UI is
+    # kept at /ui only.
     app.router.add_get("/ui", ui)

@@ -18,7 +18,7 @@ import httpx
 
 from .config import Config
 from .conversation import ConversationTracker
-from .llmclient import LLMClient, LLMError
+from .llmclient import LLMClient, LLMError, compute_seconds_from_timings
 from .metrics import Metrics
 from .power import PowerManager, ProxyState
 from .state import END, Job, JobCancelled, JobQueue, JobState
@@ -35,6 +35,7 @@ class SSEAccumulator:
         self._buf = b""
         self.content = ""
         self.usage: dict | None = None
+        self.timings: dict | None = None
 
     def feed(self, data: bytes) -> None:
         self._buf += data
@@ -57,6 +58,8 @@ class SSEAccumulator:
                 self.content += chunk
             if obj.get("usage"):
                 self.usage = obj["usage"]
+            if obj.get("timings"):
+                self.timings = obj["timings"]
 
 
 class Scheduler:
@@ -219,6 +222,7 @@ class Scheduler:
         job.cached_tokens_actual = (usage.get("prompt_tokens_details") or {}).get(
             "cached_tokens"
         )
+        job.compute_seconds_actual = compute_seconds_from_timings(acc.timings)
         job.result = {
             "role": "assistant",
             "content": acc.content,
@@ -261,4 +265,12 @@ class Scheduler:
             m.tokens_total.inc(kind="completion", amount=float(c_tok), user=job.user)
             if cached_tok:
                 m.tokens_total.inc(kind="cached", amount=float(cached_tok), user=job.user)
-            self._usage.record(job.user, p_tok, c_tok, cached_tokens=cached_tok)
+            # GPU compute time from llama.cpp timings; fall back to the job
+            # duration when the server did not report timings.
+            compute_s = job.compute_seconds_actual
+            if compute_s is None and job.started_at is not None and job.finished_at is not None:
+                compute_s = job.finished_at - job.started_at
+            self._usage.record(
+                job.user, p_tok, c_tok, cached_tokens=cached_tok,
+                compute_seconds=compute_s or 0.0,
+            )

@@ -123,7 +123,9 @@ async def usage_view(request: web.Request) -> web.Response:
     except ValueError:
         days = 7
     totals = request.app["usage"].totals(days=days)
-    return web.json_response({"days": days, "users": totals})
+    return web.json_response(
+        {"days": days, "users": totals, "daily": request.app["usage"].daily(days=days)}
+    )
 
 
 def setup(app: web.Application) -> None:

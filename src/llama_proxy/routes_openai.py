@@ -259,7 +259,14 @@ async def _pump(request, app, job, resp, hb_s):
     finally:
         if not pending.done():
             pending.cancel()
-        await agen.aclose()
+            # Wait for the in-flight __anext__ to actually settle; aclose()
+            # while it is still running raises "asynchronous generator is
+            # already running" (observed when a client disconnects mid-stream).
+            await asyncio.gather(pending, return_exceptions=True)
+        try:
+            await agen.aclose()
+        except RuntimeError:
+            pass  # generator already torn down by the cancelled __anext__
 
 
 def setup(app: web.Application) -> None:

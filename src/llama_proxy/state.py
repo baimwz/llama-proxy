@@ -50,6 +50,9 @@ class Job:
     prompt_tokens_actual: int | None = None
     completion_tokens_actual: int | None = None
     cached_tokens_actual: int | None = None  # prompt tokens served from KV cache (subset of prompt)
+    # LLM GPU time in seconds (llama.cpp timings: prompt_ms + predicted_ms).
+    # None when the server did not report timings (fallback = job duration).
+    compute_seconds_actual: float | None = None
     _seq: int = field(default=0, compare=False, repr=False)
 
     def __post_init__(self) -> None:

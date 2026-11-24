@@ -288,22 +288,41 @@ async function api(path, key) {
   const headers = key ? { Authorization: "Bearer " + key } : {};
   return fetch(path, { headers, cache: "no-store" });
 }
+let lastStatus = null;
+let statusAnchor = 0;
 function renderStatus(d) {
+  lastStatus = d;
+  statusAnchor = performance.now(); // re-anchored on every poll (15 s)
+  paintStatus();
+}
+function paintStatus() {
+  const d = lastStatus;
+  if (!d) return;
+  const elapsed_s = (performance.now() - statusAnchor) / 1000;
+  const busy = d.queue.active > 0 || d.queue.queued > 0;
+  const idle = Math.max(0, (d.idle_seconds || 0) + elapsed_s);
+  // while jobs are running the idle watchdog is paused -> freeze the
+  // countdown locally; the idle counter itself keeps running (as on the
+  // server)
+  const shutdown = Math.max(
+    0,
+    (d.shutdown_in_s == null ? 0 : d.shutdown_in_s) - (busy ? 0 : elapsed_s)
+  );
   const el = document.getElementById("st-state");
   el.textContent = d.up ? "läuft" : d.server_state;
   el.className = "badge " + (d.up ? "ok" : "bad");
   document.getElementById("st-model").textContent = d.model || "–";
   document.getElementById("st-queue").textContent =
     d.queue.active + " aktiv · " + d.queue.queued + " in Warteschlange";
-  document.getElementById("st-idle").textContent = fmtMMSS(d.idle_seconds);
+  document.getElementById("st-idle").textContent = fmtMMSS(idle);
   document.getElementById("st-boot").textContent =
     d.last_boot_s != null ? "letzte Boot-Zeit: " + fmtSecs(d.last_boot_s) : "–";
   document.getElementById("st-shutdown").textContent =
-    d.up ? fmtMMSS(d.shutdown_in_s) : "–";
-  const busy = d.queue.active > 0 || d.queue.queued > 0;
+    d.up ? fmtMMSS(shutdown) : "–";
   document.getElementById("st-pause").textContent =
     d.up && busy ? "· Jobs aktiv – Abschaltung pausiert" : "";
 }
+setInterval(paintStatus, 1000); // 1-s tick; each poll re-anchors the values
 function renderLoad(d) {
   const busyEl = document.getElementById("ld-busy");
   if (!busyEl) return;

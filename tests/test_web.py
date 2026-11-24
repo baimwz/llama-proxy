@@ -403,3 +403,22 @@ async def test_wake_click_twice_starts_single_wake(app_env):
     r2 = await client.post("/wake")  # second click while in flight
     assert (await r2.json())["waking"] is True
     assert app["power"]._wake_task is first_task
+
+
+async def test_reset_idle_postpones_shutdown(app_env):
+    app, client = app_env
+    timeout = app["cfg"].proxy.idle_timeout_s
+    # simulate 15 minutes of idleness
+    app["power"].note_activity()
+    app["power"]._last_activity = time.time() - 900
+    assert app["power"].idle_seconds > 800
+    resp = await client.post("/reset-idle")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["idle_seconds"] == 0.0
+    assert body["shutdown_in_s"] == timeout
+    assert "20:00" in body["message"]  # 1200 s default -> MM:SS in the feedback
+    assert app["power"].idle_seconds < 5
+    # /status agrees: full countdown again
+    body = await (await client.get("/status")).json()
+    assert body["shutdown_in_s"] == pytest.approx(timeout, abs=2.0)

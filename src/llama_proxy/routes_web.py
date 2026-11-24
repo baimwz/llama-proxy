@@ -53,6 +53,11 @@ def _clamp_days(request: web.Request, default: int = 30) -> int:
         return default
 
 
+def _mmss(total_s: float) -> str:
+    t = max(0, int(total_s))
+    return f"{t // 60:02d}:{t % 60:02d}"
+
+
 def _zero_totals() -> dict:
     return {
         "prompt": 0,
@@ -170,6 +175,24 @@ async def wake_server(request: web.Request) -> web.Response:
     )
 
 
+async def reset_idle(request: web.Request) -> web.Response:
+    """POST: reset the idle timer -> the idle shutdown is postponed by the
+    full timeout. Open like /wake: it only delays the shutdown, nothing
+    else (same trust model as the wake button)."""
+    app = request.app
+    power = app["power"]
+    power.note_activity()
+    timeout_s = app["cfg"].proxy.idle_timeout_s
+    return web.json_response(
+        {
+            "state": power.state.value,
+            "idle_seconds": 0.0,
+            "shutdown_in_s": timeout_s,
+            "message": f"Idle-Timer zurückgesetzt – Abschaltung in {_mmss(timeout_s)}",
+        }
+    )
+
+
 async def personal_page(request: web.Request) -> web.Response:
     resp = web.Response(
         text=PERSONAL_HTML, content_type="text/html", charset="utf-8"
@@ -191,6 +214,7 @@ def setup(app: web.Application) -> None:
     app.router.add_get("/usage/recent", usage_recent)
     app.router.add_get("/status", status_view)
     app.router.add_post("/wake", wake_server)
+    app.router.add_post("/reset-idle", reset_idle)
 
 
 # ---------------------------------------------------------------------------
@@ -256,12 +280,9 @@ function fmtSecs(s) {
   if (v >= 90) return (v / 60).toLocaleString("de-DE", {maximumFractionDigits: 1}) + " min";
   return v.toLocaleString("de-DE", {maximumFractionDigits: 1}) + " s";
 }
-function fmtCountdown(s) {
-  if (s == null) return "–";
-  if (s < 60) return "< 1 min";
-  const m = s / 60;
-  if (m < 120) return m.toLocaleString("de-DE", {maximumFractionDigits: 1}) + " min";
-  return (m / 60).toLocaleString("de-DE", {maximumFractionDigits: 1}) + " h";
+function fmtMMSS(s) {
+  const t = Math.max(0, Math.floor(Number(s) || 0));
+  return String(Math.floor(t / 60)).padStart(2, "0") + ":" + String(t % 60).padStart(2, "0");
 }
 async function api(path, key) {
   const headers = key ? { Authorization: "Bearer " + key } : {};
@@ -274,11 +295,11 @@ function renderStatus(d) {
   document.getElementById("st-model").textContent = d.model || "–";
   document.getElementById("st-queue").textContent =
     d.queue.active + " aktiv · " + d.queue.queued + " in Warteschlange";
-  document.getElementById("st-idle").textContent = Math.round(d.idle_seconds) + " s";
+  document.getElementById("st-idle").textContent = fmtMMSS(d.idle_seconds);
   document.getElementById("st-boot").textContent =
     d.last_boot_s != null ? "letzte Boot-Zeit: " + fmtSecs(d.last_boot_s) : "–";
   document.getElementById("st-shutdown").textContent =
-    d.up ? fmtCountdown(d.shutdown_in_s) : "–";
+    d.up ? fmtMMSS(d.shutdown_in_s) : "–";
   const busy = d.queue.active > 0 || d.queue.queued > 0;
   document.getElementById("st-pause").textContent =
     d.up && busy ? "· Jobs aktiv – Abschaltung pausiert" : "";
@@ -322,15 +343,15 @@ async function refreshShared() {
   if (rs.ok) renderStatus(await rs.json());
   if (rl.ok) renderLoad(await rl.json());
 }
-function initWake() {
-  const btn = document.getElementById("wake-btn");
+function initActionBtn(btnId, url, label) {
+  const btn = document.getElementById(btnId);
   if (!btn) return;
   btn.addEventListener("click", async () => {
     btn.disabled = true;
-    const msg = document.getElementById("wake-msg");
-    msg.textContent = "Starte Wake-on-LAN …";
+    const msg = document.getElementById("action-msg");
+    msg.textContent = label + " …";
     try {
-      const r = await fetch("/wake", { method: "POST" });
+      const r = await fetch(url, { method: "POST" });
       let b = {};
       try { b = await r.json(); } catch (e) { /* ignore */ }
       msg.textContent = (b && b.message) || (r.ok ? "OK" : "Fehler (" + r.status + ")");
@@ -340,6 +361,10 @@ function initWake() {
     }
     btn.disabled = false;
   });
+}
+function initWake() {
+  initActionBtn("wake-btn", "/wake", "Starte Wake-on-LAN");
+  initActionBtn("idle-reset-btn", "/reset-idle", "Setze Abschaltung zurück");
 }
 """
 
@@ -439,9 +464,10 @@ _PERSONAL_HTML = """<!doctype html>
     <p class="muted" style="margin:.6rem 0 0">
       <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span>
     </p>
-    <p style="margin:.7rem 0 0">
+    <p class="row" style="margin:.7rem 0 0">
       <button id="wake-btn" type="button">Server wecken</button>
-      <span id="wake-msg" class="muted"></span>
+      <button id="idle-reset-btn" type="button" class="secondary">Abschaltung zurücksetzen</button>
+      <span id="action-msg" class="muted"></span>
     </p>
   </section>
 
@@ -622,9 +648,10 @@ _ADMIN_HTML = """<!doctype html>
     <p class="muted" style="margin:.6rem 0 0">
       <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span>
     </p>
-    <p style="margin:.7rem 0 0">
+    <p class="row" style="margin:.7rem 0 0">
       <button id="wake-btn" type="button">Server wecken</button>
-      <span id="wake-msg" class="muted"></span>
+      <button id="idle-reset-btn" type="button" class="secondary">Abschaltung zurücksetzen</button>
+      <span id="action-msg" class="muted"></span>
     </p>
   </section>
 

@@ -18,7 +18,7 @@ import httpx
 
 from .config import Config
 from .conversation import ConversationTracker
-from .llmclient import LLMClient, LLMError, compute_seconds_from_timings
+from .llmclient import LLMClient, LLMError, phase_seconds_from_timings
 from .load import RecentLoad
 from .metrics import Metrics
 from .power import PowerManager, ProxyState
@@ -146,7 +146,7 @@ class Scheduler:
     async def _run_job(self, job: Job) -> None:
         job.state = JobState.RUNNING
         job.started_at = time.time()
-        self._power.note_activity()
+        self._power.note_user_activity(job.user)
         try:
             await self._execute(job)
             job.state = JobState.DONE
@@ -163,7 +163,9 @@ class Scheduler:
         finally:
             job.finished_at = time.time()
             self._queue.finish(job)
-            self._power.note_activity()
+            # user activity at the end, too: it is the last moment this user
+            # "caused" the server to be on, and it closes any open idle gap
+            self._power.note_user_activity(job.user)
             self._finalize_metrics(job)
 
     async def _execute(self, job: Job) -> None:
@@ -225,7 +227,11 @@ class Scheduler:
         job.cached_tokens_actual = (usage.get("prompt_tokens_details") or {}).get(
             "cached_tokens"
         )
-        job.compute_seconds_actual = compute_seconds_from_timings(acc.timings)
+        phases = phase_seconds_from_timings(acc.timings)
+        if phases is not None:
+            job.prefill_seconds_actual = phases[0]
+            job.generation_seconds_actual = phases[1]
+            job.compute_seconds_actual = phases[0] + phases[1]
         job.result = {
             "role": "assistant",
             "content": acc.content,
@@ -273,9 +279,28 @@ class Scheduler:
             compute_s = job.compute_seconds_actual
             if compute_s is None and job.started_at is not None and job.finished_at is not None:
                 compute_s = job.finished_at - job.started_at
+            prefill_s = job.prefill_seconds_actual
+            generation_s = job.generation_seconds_actual
+            if prefill_s is None and generation_s is None and job.started_at is not None:
+                # no timings from the server: attribute the whole job duration
+                # to generation (Anton's fallback)
+                prefill_s = 0.0
+                generation_s = compute_s or 0.0
+            prefill_s = prefill_s or 0.0
+            generation_s = generation_s or 0.0
+            # Energy estimate: each phase at its configured average draw
+            # (W * s / 3600 = Wh). Replaced by measurements later - the logic
+            # stays the same, only the config values change.
+            energy_wh = (
+                prefill_s * self._cfg.power.power_prefill_w
+                + generation_s * self._cfg.power.power_generation_w
+            ) / 3600.0
             self._usage.record(
                 job.user, p_tok, c_tok, cached_tokens=cached_tok,
                 compute_seconds=compute_s or 0.0,
+                prefill_seconds=prefill_s,
+                generation_seconds=generation_s,
+                energy_wh=energy_wh,
             )
             # same value as the usage tracker - single source of truth
             self._load.record(job.user, compute_s or 0.0)

@@ -76,9 +76,20 @@ def create_app(cfg: Config) -> web.Application:
     metrics.jobs_active_small.value_fn = _small_active
     metrics.jobs_active_large.value_fn = _large_active
 
+    def _record_idle_gap(gap_s: float, users: list[str], share_s: float) -> None:
+        """Book a settled idle gap: equal share per user + idle energy (Wh)."""
+        idle_w = cfg.power.power_idle_w
+        for u in users:
+            app["usage"].record(
+                u, 0, 0, requests=0,
+                idle_seconds=share_s,
+                energy_wh=share_s * idle_w / 3600.0,
+            )
+
     async def on_startup(_app: web.Application) -> None:
         log.info("llama-proxy %s starting (llm=%s)", __version__, cfg.llm.base_url)
         await app["counter"].load()
+        app["power"].set_idle_gap_handler(_record_idle_gap)
         # probe: maybe the server is already up
         if await app["llm"].health():
             app["power"].mark_ready()

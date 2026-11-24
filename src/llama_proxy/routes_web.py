@@ -65,6 +65,10 @@ def _zero_totals() -> dict:
         "cached": 0,
         "requests": 0,
         "compute_seconds": 0.0,
+        "prefill_seconds": 0.0,
+        "generation_seconds": 0.0,
+        "idle_seconds": 0.0,
+        "energy_wh": 0.0,
     }
 
 
@@ -113,16 +117,27 @@ async def status_view(request: web.Request) -> web.Response:
     power = app["power"]
     active = app["queue"].active()
     timeout_s = app["cfg"].proxy.idle_timeout_s
+    busy = app["queue"].busy()
+    # While jobs are running the server is NOT idle: the idle time stays at
+    # 0:00 and the countdown shows the full timeout. Both start counting
+    # again the moment the last job finished (note_user_activity resets the
+    # idle timer), and the watchdog only fires when idle >= timeout AND no
+    # jobs are active (see power.idle_watchdog).
+    if busy:
+        idle_s = 0.0
+        shutdown_in_s = timeout_s
+    else:
+        idle_s = power.idle_seconds
+        shutdown_in_s = max(0.0, timeout_s - power.idle_seconds)
     return web.json_response(
         {
             "server_state": power.state.value,
             "up": power.state.value == "ready",
             "model": app["cfg"].llm.model_name,
-            "idle_seconds": round(power.idle_seconds, 1),
+            "busy": busy,
+            "idle_seconds": round(idle_s, 1),
             "idle_timeout_s": timeout_s,
-            # countdown to the idle shutdown; the watchdog only fires when
-            # idle >= timeout AND no jobs are active (see power.idle_watchdog)
-            "shutdown_in_s": round(max(0.0, timeout_s - power.idle_seconds), 1),
+            "shutdown_in_s": round(shutdown_in_s, 1),
             "last_boot_s": power.last_boot_s,
             "queue": {
                 "active": len(active),
@@ -284,6 +299,11 @@ function fmtMMSS(s) {
   const t = Math.max(0, Math.floor(Number(s) || 0));
   return String(Math.floor(t / 60)).padStart(2, "0") + ":" + String(t % 60).padStart(2, "0");
 }
+function fmtWh(w) {
+  const v = Number(w || 0);
+  if (v >= 1000) return (v / 1000).toLocaleString("de-DE", {maximumFractionDigits: 2}) + " kWh";
+  return v.toLocaleString("de-DE", {maximumFractionDigits: 1}) + " Wh";
+}
 async function api(path, key) {
   const headers = key ? { Authorization: "Bearer " + key } : {};
   return fetch(path, { headers, cache: "no-store" });
@@ -299,15 +319,18 @@ function paintStatus() {
   const d = lastStatus;
   if (!d) return;
   const elapsed_s = (performance.now() - statusAnchor) / 1000;
-  const busy = d.queue.active > 0 || d.queue.queued > 0;
-  const idle = Math.max(0, (d.idle_seconds || 0) + elapsed_s);
-  // while jobs are running the idle watchdog is paused -> freeze the
-  // countdown locally; the idle counter itself keeps running (as on the
-  // server)
-  const shutdown = Math.max(
-    0,
-    (d.shutdown_in_s == null ? 0 : d.shutdown_in_s) - (busy ? 0 : elapsed_s)
-  );
+  const busy = d.busy == null
+    ? (d.queue.active > 0 || d.queue.queued > 0)
+    : d.busy;
+  const timeout_s = Number(d.idle_timeout_s || 0);
+  // While jobs are running the server is NOT idle: idle stays 0:00 and the
+  // countdown the full timeout (frozen). Both count again every second the
+  // moment the last job finished - the server reports the fresh values on
+  // the next poll and this tick continues from there.
+  const idle = busy ? 0 : Math.max(0, (d.idle_seconds || 0) + elapsed_s);
+  const shutdown = busy
+    ? timeout_s
+    : Math.max(0, (d.shutdown_in_s == null ? timeout_s : d.shutdown_in_s) - elapsed_s);
   const el = document.getElementById("st-state");
   el.textContent = d.up ? "läuft" : d.server_state;
   el.className = "badge " + (d.up ? "ok" : "bad");
@@ -320,7 +343,7 @@ function paintStatus() {
   document.getElementById("st-shutdown").textContent =
     d.up ? fmtMMSS(shutdown) : "–";
   document.getElementById("st-pause").textContent =
-    d.up && busy ? "· Jobs aktiv – Abschaltung pausiert" : "";
+    d.up && busy ? "· Jobs aktiv – Idle-Zeit und Abschaltung pausiert" : "";
 }
 setInterval(paintStatus, 1000); // 1-s tick; each poll re-anchors the values
 function renderLoad(d) {
@@ -392,6 +415,13 @@ const KEY_SLOT = "llama_proxy_key";
 let days = 30;
 const $ = (id) => document.getElementById(id);
 
+function usageCells(r) {
+  return "<td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
+    fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
+    fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td><td>" +
+    fmtSecs(r.prefill_seconds) + "</td><td>" + fmtSecs(r.generation_seconds) +
+    "</td><td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
+}
 function renderUsage(d) {
   $("user-badge").textContent = d.user;
   const t = d.totals || {};
@@ -399,19 +429,20 @@ function renderUsage(d) {
   const tbody = $("usage-tbody");
   tbody.innerHTML = "";
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">Noch keine Nutzung in dem Zeitraum.</td></tr>';
+    tbody.innerHTML =
+      '<tr><td colspan="10" class="muted">Noch keine Nutzung in dem Zeitraum.</td></tr>';
   }
   for (const r of rows.slice().reverse()) {
     const tr = document.createElement("tr");
-    tr.innerHTML = "<td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
-      fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
-      fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td>";
+    tr.innerHTML = usageCells(r);
     tbody.appendChild(tr);
   }
-  $("usage-tfoot").innerHTML =
-    '<tr><td>Summe (' + days + " Tage)</td><td>" + fmtInt(t.prompt) + "</td><td>" +
-    fmtInt(t.completion) + "</td><td>" + fmtInt(t.cached) + "</td><td>" +
-    fmtInt(t.requests) + "</td><td>" + fmtSecs(t.compute_seconds) + "</td></tr>";
+  const tsum = {day: "Summe (" + days + " Tage)"};
+  for (const k of ["prompt","completion","cached","requests","compute_seconds",
+                   "prefill_seconds","generation_seconds","idle_seconds","energy_wh"]) {
+    tsum[k] = t[k] || 0;
+  }
+  $("usage-tfoot").innerHTML = "<tr>" + usageCells(tsum) + "</tr>";
 }
 
 function setLoginVisible(v) {
@@ -515,13 +546,19 @@ _PERSONAL_HTML = """<!doctype html>
     </h2>
     <table>
       <thead>
-        <tr><th>Datum</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th><th>Rechenzeit</th></tr>
+        <tr><th>Datum</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
+        <th>Rechenzeit</th><th>Prefill</th><th>Generation</th><th>Idle</th><th>Strom</th></tr>
       </thead>
       <tbody id="usage-tbody"></tbody>
       <tfoot id="usage-tfoot"></tfoot>
     </table>
     <p class="muted" style="margin:.6rem 0 0">
       Rechenzeit = GPU-Berechnungszeit des LLM (llama.cpp timings), pro Tag.
+      Prefill = Prompt-Verarbeitung, Generation = Antwort-Generierung.
+      Idle = Zeit, in der der Server für dich an war, aber nicht rechnete
+      (bei mehreren aktiven Nutzern anteilig aufgeteilt).
+      Strom = Näherung aus den konfigurierten Durchschnittsverbräuchen
+      (idle / prefill / generation in W) – später durch Messwerte ersetzt.
     </p>
   </section>
 
@@ -553,16 +590,23 @@ const KEY_SLOT = "llama_proxy_master_key";
 let days = 30;
 const $ = (id) => document.getElementById(id);
 
+const USAGE_COLS = '<th>Datum</th><th>Prompt</th><th>Completion</th><th>Cached</th>' +
+  '<th>Anfragen</th><th>Rechenzeit</th><th>Prefill</th><th>Generation</th>' +
+  '<th>Idle</th><th>Strom</th>';
 function dailyTable(rows) {
   if (!rows.length) return '<p class="muted">keine Daten in dem Zeitraum</p>';
-  let html = '<table><thead><tr><th>Datum</th><th>Prompt</th><th>Completion</th>' +
-    '<th>Cached</th><th>Anfragen</th><th>Rechenzeit</th></tr></thead><tbody>';
+  let html = '<table><thead><tr>' + USAGE_COLS + '</tr></thead><tbody>';
   for (const r of rows.slice().reverse()) {
-    html += "<tr><td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
-      fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
-      fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td></tr>";
+    html += "<tr>" + usageCells(r) + "</tr>";
   }
   return html + "</tbody></table>";
+}
+function usageCells(r) {
+  return "<td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
+    fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
+    fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td><td>" +
+    fmtSecs(r.prefill_seconds) + "</td><td>" + fmtSecs(r.generation_seconds) +
+    "</td><td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
 }
 
 function renderAdmin(data, keys) {
@@ -572,10 +616,12 @@ function renderAdmin(data, keys) {
     const t = data.users[name];
     html += "<tr><td>" + name + "</td><td>" + fmtInt(t.prompt) + "</td><td>" +
       fmtInt(t.completion) + "</td><td>" + fmtInt(t.cached) + "</td><td>" +
-      fmtInt(t.requests) + "</td><td>" + fmtSecs(t.compute_seconds) + "</td></tr>";
+      fmtInt(t.requests) + "</td><td>" + fmtSecs(t.compute_seconds) + "</td><td>" +
+      fmtSecs(t.prefill_seconds) + "</td><td>" + fmtSecs(t.generation_seconds) +
+      "</td><td>" + fmtSecs(t.idle_seconds) + "</td><td>" + fmtWh(t.energy_wh) + "</td></tr>";
   }
   $("users-tbody").innerHTML =
-    html || '<tr><td colspan="6" class="muted">Noch keine Nutzungsdaten.</td></tr>';
+    html || '<tr><td colspan="10" class="muted">Noch keine Nutzungsdaten.</td></tr>';
 
   let dh = "";
   for (const name of users) {
@@ -700,10 +746,18 @@ _ADMIN_HTML = """<!doctype html>
       </h2>
       <table>
         <thead>
-          <tr><th>User</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th><th>Rechenzeit</th></tr>
+          <tr><th>User</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
+          <th>Rechenzeit</th><th>Prefill</th><th>Generation</th><th>Idle</th><th>Strom</th></tr>
         </thead>
         <tbody id="users-tbody"></tbody>
       </table>
+      <p class="muted" style="margin:.6rem 0 0">
+        Prefill = Prompt-Verarbeitung, Generation = Antwort-Generierung.
+        Idle = Server an, aber nicht rechnend; anteilig auf kürzlich aktive
+        Nutzer aufgeteilt. Strom = Näherung aus konfigurierten
+        Durchschnittsverbräuchen (idle / prefill / generation in W) –
+        später durch Messwerte ersetzt.
+      </p>
     </section>
 
     <section class="card">

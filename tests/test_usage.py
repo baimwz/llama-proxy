@@ -1,5 +1,7 @@
 from datetime import date, timedelta
 
+import pytest
+
 from llama_proxy.usage import UsageTracker
 
 
@@ -72,6 +74,49 @@ def test_record_on_legacy_row_backfills_cached(tmp_path):
     totals = u.totals(days=30)
     assert totals["u1"]["cached"] == 6
     assert totals["u1"]["requests"] == 2
+
+
+def test_phase_idle_energy_recorded(tmp_path):
+    # a job entry: tokens + phase seconds + its energy share
+    u = UsageTracker(str(tmp_path), 60)
+    u.record(
+        "anton", 100, 50, 1, cached_tokens=10,
+        compute_seconds=2.0, prefill_seconds=0.5,
+        generation_seconds=1.5,
+        energy_wh=(0.5 * 270 + 1.5 * 320) / 3600,
+    )
+    # an idle-gap settlement: no tokens/requests, only idle time + energy
+    u.record("anton", 0, 0, requests=0, idle_seconds=120, energy_wh=120 * 80 / 3600)
+    totals = u.totals()
+    assert totals["anton"]["requests"] == 1
+    assert totals["anton"]["compute_seconds"] == pytest.approx(2.0)
+    assert totals["anton"]["prefill_seconds"] == pytest.approx(0.5)
+    assert totals["anton"]["generation_seconds"] == pytest.approx(1.5)
+    assert totals["anton"]["idle_seconds"] == pytest.approx(120.0)
+    expected_wh = (0.5 * 270 + 1.5 * 320) / 3600 + 120 * 80 / 3600
+    assert totals["anton"]["energy_wh"] == pytest.approx(expected_wh, rel=1e-6)
+    row = u.daily("anton")["anton"][0]
+    assert row["prefill_seconds"] == pytest.approx(0.5)
+    assert row["generation_seconds"] == pytest.approx(1.5)
+    assert row["idle_seconds"] == pytest.approx(120.0)
+    assert row["energy_wh"] == pytest.approx(expected_wh, rel=1e-6)
+
+
+def test_legacy_rows_without_phase_fields(tmp_path):
+    # rows written before the phase/idle/energy fields existed must load
+    # cleanly, aggregate as zeros, and accept new records (backfill)
+    day = date.today().isoformat()
+    u = UsageTracker(str(tmp_path), 60)
+    u._data["u1"] = {day: {"prompt": 5, "completion": 1, "requests": 1,
+                           "compute_seconds": 1.0}}
+    totals = u.totals(days=30)
+    assert totals["u1"]["prefill_seconds"] == 0
+    assert totals["u1"]["generation_seconds"] == 0
+    assert totals["u1"]["idle_seconds"] == 0
+    assert totals["u1"]["energy_wh"] == 0
+    # record() on such a legacy row must not raise (backfills the fields)
+    u.record("u1", 0, 0, requests=0, idle_seconds=60, energy_wh=60 * 80 / 3600)
+    assert u.totals(days=30)["u1"]["idle_seconds"] == pytest.approx(60.0)
 
 
 def test_reload_backfills_legacy_rows(tmp_path):

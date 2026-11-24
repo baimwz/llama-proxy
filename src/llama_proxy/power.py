@@ -39,6 +39,11 @@ class PowerError(RuntimeError):
     pass
 
 
+# How far beyond a settled idle gap a user's last activity still counts
+# towards attributing the gap to them (equal split, see ``_close_gap``).
+IDLE_ATTRIBUTION_PAD_S = 60.0
+
+
 # ---------------------------------------------------------------------------
 # Wake-on-LAN
 # ---------------------------------------------------------------------------
@@ -164,6 +169,11 @@ class PowerManager:
             self._power_on = lambda: send_magic_packet(mac, bcast)
         self._pre_shutdown: Callable[[], Awaitable[None]] | None = None
         self._power_off: Callable[[], Awaitable[None]] | None = None
+        # Idle-gap attribution (per-user idle time + energy):
+        self._user_activity: dict[str, float] = {}  # user -> last activity (wall clock)
+        self._idle_gap_handler: Callable[[float, list[str], float], None] | None = None
+        self._gap_active = False
+        self._gap_start = 0.0
         if p.ssh_host:
             ssh = SshPoweroff(p.ssh_host, p.ssh_user, p.ssh_key_path, p.ssh_command)
             self._power_off = ssh.poweroff
@@ -177,9 +187,76 @@ class PowerManager:
     def note_activity(self) -> None:
         self._last_activity = time.time()
 
+    def note_user_activity(self, user: str) -> None:
+        """Record that `user` is active (a job started or finished).
+
+        Resets the idle timer (like ``note_activity``) and updates the
+        per-user activity log used to attribute finished idle gaps. If an
+        idle gap is open, this event closes it: a new job is exactly what
+        ends the "server on but idle" period.
+        """
+        self.note_activity()
+        self._user_activity[user] = time.time()
+        if self._gap_active:
+            self._close_gap(time.time() - self._gap_start)
+
     @property
     def idle_seconds(self) -> float:
         return max(0.0, time.time() - self._last_activity)
+
+    # -- idle-gap attribution -------------------------------------------------
+
+    def set_idle_gap_handler(
+        self, handler: Callable[[float, list[str], float], None]
+    ) -> None:
+        """Register the callback that books a settled idle gap.
+
+        Called once per gap with ``(gap_seconds, users, share_seconds)``
+        where ``users`` are the distinct recently-active users and each one
+        gets an equal share of the gap (Anton's decision). The handler is
+        responsible for writing the usage rows (idle seconds + idle energy).
+        """
+        self._idle_gap_handler = handler
+
+    def observe_idle(self, busy: bool) -> None:
+        """Watchdog tick: track the boundaries of "server on, not computing".
+
+        A gap opens when the state is READY and nothing is queued/running,
+        and closes on the next user activity (``note_user_activity``) or as
+        soon as the state leaves that condition (boot, off, shutting down,
+        server died).
+        """
+        idle_now = self.state is ProxyState.READY and not busy
+        if idle_now and not self._gap_active:
+            self._gap_active = True
+            # the gap began when the server last became idle (a job ended,
+            # or it just booted) - not on this tick
+            self._gap_start = min(self._last_activity, time.time())
+        elif not idle_now and self._gap_active:
+            self._close_gap(time.time() - self._gap_start)
+
+    def _close_gap(self, gap_s: float) -> None:
+        """Attribute a finished idle gap, evenly, to the recently active users."""
+        if not self._gap_active:
+            return
+        self._gap_active = False
+        if gap_s <= 0:
+            return
+        now = time.time()
+        cutoff = now - (gap_s + IDLE_ATTRIBUTION_PAD_S)
+        users = sorted(u for u, t in self._user_activity.items() if t >= cutoff)
+        if not users:
+            log.info("idle gap %.1fs not attributed (no recently active users)", gap_s)
+            return
+        share = gap_s / len(users)
+        log.info("attributing %.1fs idle evenly to: %s", gap_s, ", ".join(users))
+        handler = self._idle_gap_handler
+        if handler is None:
+            return
+        try:
+            handler(gap_s, users, share)
+        except Exception:  # noqa: BLE001 - booking must never break the power loop
+            log.exception("idle gap handler failed")
 
     def note_healthy(self) -> None:
         """Record that the server answered a health check."""
@@ -196,12 +273,16 @@ class PowerManager:
 
     def degrade(self) -> None:
         """Server stopped responding (powered off / crashed) -> back to OFF."""
+        self._close_gap(time.time() - self._gap_start)
         self.state = ProxyState.OFF
         self._tracker.invalidate()
 
     def mark_ready(self) -> None:
         self.state = ProxyState.READY
         self.last_healthy_at = time.time()
+        # the server only became available now: idle counting (and any idle
+        # gap) starts from here, not from before the boot
+        self.note_activity()
 
     # -- readiness ----------------------------------------------------------
 
@@ -308,6 +389,8 @@ class PowerManager:
     async def shutdown(self) -> None:
         if self.state is not ProxyState.READY:
             return
+        # the idle period ends at the moment we shut the server down
+        self._close_gap(time.time() - self._gap_start)
         if self._power_off is None:
             log.info("no power-off backend configured; skipping shutdown")
             return
@@ -370,6 +453,8 @@ class PowerManager:
         failures = 0
         while True:
             await asyncio.sleep(tick)
+            busy = busy_check()
+            self.observe_idle(busy)
             if self.state is ProxyState.READY:
                 try:
                     healthy = await self._health()
@@ -387,7 +472,7 @@ class PowerManager:
                         continue
             if (
                 self.state is ProxyState.READY
-                and not busy_check()
+                and not busy
                 and self.idle_seconds >= self._cfg.proxy.idle_timeout_s
             ):
                 log.info("idle timeout reached (%.0fs); shutting server down", self.idle_seconds)

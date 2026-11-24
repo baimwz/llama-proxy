@@ -55,6 +55,12 @@ class PowerConfig:
     # Set to 0 to send exactly once (old behaviour).
     wol_resend_interval_s: float = 15.0
     shutdown_verify_timeout_s: float = 30.0
+    # Average power draw of the LLM host in watts, per phase. Used to
+    # estimate per-user energy (Wh) in the usage tables until real
+    # measurements replace these values (logic stays the same).
+    power_idle_w: float = 80.0
+    power_prefill_w: float = 270.0
+    power_generation_w: float = 320.0
 
 
 @dataclass

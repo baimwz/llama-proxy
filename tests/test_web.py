@@ -9,10 +9,11 @@ import aiohttp.web_request
 import pytest
 
 from conftest import chat_payload
-from llama_proxy.llmclient import compute_seconds_from_timings
+from llama_proxy.llmclient import compute_seconds_from_timings, phase_seconds_from_timings
 from llama_proxy.load import RecentLoad
 from llama_proxy.power import ProxyState
 from llama_proxy.routes_web import resolve_web_identity
+from llama_proxy.state import Job, JobState
 
 
 @pytest.fixture
@@ -207,6 +208,20 @@ def test_compute_seconds_from_timings_helper():
     assert compute_seconds_from_timings({"prompt_ms": "x"}) is None
 
 
+def test_phase_seconds_from_timings_helper():
+    # prompt_ms -> prefill, predicted_ms -> generation
+    assert phase_seconds_from_timings({"prompt_ms": 100, "predicted_ms": 200}) == (0.1, 0.2)
+    assert phase_seconds_from_timings({"prompt_ms": 0, "predicted_ms": 0}) == (0.0, 0.0)
+    assert phase_seconds_from_timings(None) is None
+    assert phase_seconds_from_timings("garbage") is None
+    assert phase_seconds_from_timings({"prompt_ms": "x"}) is None
+    # the sum must equal the old total
+    p, g = phase_seconds_from_timings({"prompt_ms": 100, "predicted_ms": 200})
+    assert p + g == pytest.approx(compute_seconds_from_timings(
+        {"prompt_ms": 100, "predicted_ms": 200}
+    ))
+
+
 async def test_compute_seconds_recorded_non_stream(app_env):
     # mock LLM reports timings: 100 ms prompt + 200 ms predicted = 0.3 s
     app, client = app_env
@@ -269,7 +284,9 @@ async def test_daily_shape(app_env):
     resp = await client.get("/admin/usage?days=7", headers={"Authorization": "Bearer mkey"})
     body = await resp.json()
     row = body["daily"]["anton"][0]
-    for field in ("day", "prompt", "completion", "cached", "requests", "compute_seconds"):
+    for field in ("day", "prompt", "completion", "cached", "requests",
+                  "compute_seconds", "prefill_seconds", "generation_seconds",
+                  "idle_seconds", "energy_wh"):
         assert field in row
 
 
@@ -353,6 +370,57 @@ async def test_status_countdown_fields(app_env):
     app["power"]._last_activity = time.time() - 300
     body = await (await client.get("/status")).json()
     assert body["shutdown_in_s"] == pytest.approx(timeout - 300, abs=2.0)
+
+
+async def test_status_busy_shows_zero_idle_and_full_countdown(app_env):
+    # Anton: while a job runs, idle must stay 0:00 and the countdown 20:00
+    app, client = app_env
+    timeout = app["cfg"].proxy.idle_timeout_s
+    app["power"]._last_activity = time.time() - 300  # old activity
+    job = Job(id=None, kind="chat", payload={}, prompt_text="x", user="anton")
+    app["queue"].add(job)
+    job.state = JobState.RUNNING
+    app["queue"]._in_flight.add(job.id)
+    try:
+        body = await (await client.get("/status")).json()
+        assert body["busy"] is True
+        assert body["idle_seconds"] == 0
+        assert body["shutdown_in_s"] == timeout
+    finally:
+        app["queue"]._in_flight.discard(job.id)
+    # not busy anymore -> idle counting resumes from the old activity
+    body = await (await client.get("/status")).json()
+    assert body["busy"] is False
+    assert body["idle_seconds"] == pytest.approx(300, abs=2.0)
+    assert body["shutdown_in_s"] == pytest.approx(timeout - 300, abs=2.0)
+
+
+async def test_idle_gap_even_split_recorded_in_usage(app_env):
+    # Alice's job ended, the server idles ~2 min, then Bob's job starts:
+    # the idle gap must be split 50/50 and booked with idle energy (80 W).
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+    _, alice = app["keys"].create("alice")
+    _, bob = app["keys"].create("bob")
+    # keep the watchdog from touching the gap state while we set it up
+    watchdog = next(t for t in app["tasks"] if t.get_name() == "idle-watchdog")
+    watchdog.cancel()
+    app["power"].note_user_activity("alice")
+    app["power"]._last_activity = time.time() - 120  # 2 min of idleness
+    app["power"].observe_idle(False)                  # gap opens
+    resp = await client.post(
+        "/v1/chat/completions", json=chat_payload(),
+        headers={"Authorization": f"Bearer {bob}"},
+    )
+    assert resp.status == 200
+    await _wait_for_usage(app, "bob")
+    totals = app["usage"].totals()
+    assert totals["alice"]["idle_seconds"] == pytest.approx(60, abs=5)
+    assert totals["bob"]["idle_seconds"] == pytest.approx(60, abs=5)
+    # idle energy: 60 s * 80 W / 3600 = 1.33 Wh each
+    assert totals["alice"]["energy_wh"] == pytest.approx(60 * 80 / 3600, rel=0.1)
+    assert totals["alice"]["requests"] == 0  # idle time is not a request
+    assert totals["alice"]["prompt"] == 0
 
 
 # --- wake button (POST /wake) -------------------------------------------------

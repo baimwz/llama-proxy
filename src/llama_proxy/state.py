@@ -53,6 +53,13 @@ class Job:
     # LLM GPU time in seconds (llama.cpp timings: prompt_ms + predicted_ms).
     # None when the server did not report timings (fallback = job duration).
     compute_seconds_actual: float | None = None
+    # Phase split of the GPU time (llama.cpp timings):
+    #   prefill    = prompt processing   (prompt_ms)
+    #   generation = answer generation   (predicted_ms)
+    # Both None when the server did not report timings; the scheduler then
+    # attributes the whole job duration to generation (fallback).
+    prefill_seconds_actual: float | None = None
+    generation_seconds_actual: float | None = None
     _seq: int = field(default=0, compare=False, repr=False)
 
     def __post_init__(self) -> None:

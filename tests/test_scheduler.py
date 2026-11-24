@@ -2,6 +2,8 @@ import asyncio
 import tempfile
 from contextlib import asynccontextmanager
 
+import pytest
+
 from llama_proxy.config import Config
 from llama_proxy.conversation import ConversationTracker
 from llama_proxy.load import RecentLoad
@@ -216,6 +218,73 @@ async def test_failed_job_recorded():
     await wait_idle(queue)
     assert job.state is JobState.FAILED
     assert "boom" in (job.error or "")
+
+
+async def test_phase_split_and_energy_recorded():
+    sched, queue, _ = make(scheduler={})
+
+    class TimedLLM(StubLLM):
+        async def forward(self, job: Job) -> dict:
+            await asyncio.sleep(0.01)
+            job.prompt_tokens_actual = 10
+            job.completion_tokens_actual = 5
+            job.prefill_seconds_actual = 0.5
+            job.generation_seconds_actual = 1.5
+            job.compute_seconds_actual = 2.0
+            return {"choices": []}
+
+    sched._llm = TimedLLM()
+    job = mkjob("hello")
+    sched.enqueue(job)
+    sched.dispatch_once()
+    await wait_idle(queue)
+    assert job.state is JobState.DONE
+    t = sched._usage.totals()["default"]
+    assert t["compute_seconds"] == pytest.approx(2.0)
+    assert t["prefill_seconds"] == pytest.approx(0.5)
+    assert t["generation_seconds"] == pytest.approx(1.5)
+    # 0.5 s @ 270 W + 1.5 s @ 320 W (config defaults)
+    assert t["energy_wh"] == pytest.approx((0.5 * 270 + 1.5 * 320) / 3600, rel=1e-6)
+    assert t["idle_seconds"] == 0
+
+
+async def test_phase_fallback_without_timings():
+    # StubLLM reports no timings: the whole job duration goes to generation
+    sched, queue, _ = make(scheduler={})
+    job = mkjob("hello")
+    sched.enqueue(job)
+    sched.dispatch_once()
+    await wait_idle(queue)
+    assert job.state is JobState.DONE
+    assert job.compute_seconds_actual is None
+    t = sched._usage.totals()["default"]
+    assert t["compute_seconds"] > 0
+    assert t["prefill_seconds"] == 0
+    assert t["generation_seconds"] == pytest.approx(t["compute_seconds"])
+    # tolerance covers the 2-decimal rounding of the displayed seconds
+    assert t["energy_wh"] == pytest.approx(
+        t["generation_seconds"] * 320 / 3600, abs=0.001
+    )
+
+
+async def test_custom_power_config_changes_energy():
+    # the watt values are config: changing them changes the energy, not the logic
+    sched, queue, _ = make(power={"power_prefill_w": 100.0, "power_generation_w": 200.0})
+
+    class TimedLLM(StubLLM):
+        async def forward(self, job: Job) -> dict:
+            job.prefill_seconds_actual = 1.0
+            job.generation_seconds_actual = 1.0
+            job.compute_seconds_actual = 2.0
+            return {"choices": []}
+
+    sched._llm = TimedLLM()
+    job = mkjob("hello")
+    sched.enqueue(job)
+    sched.dispatch_once()
+    await wait_idle(queue)
+    t = sched._usage.totals()["default"]
+    assert t["energy_wh"] == pytest.approx((1.0 * 100 + 1.0 * 200) / 3600, rel=1e-6)
 
 
 async def test_nonstream_rewakes_on_dead_connection():

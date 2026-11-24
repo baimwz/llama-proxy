@@ -18,8 +18,11 @@ class LLMError(RuntimeError):
     pass
 
 
-def compute_seconds_from_timings(timings) -> float | None:
-    """Turn llama.cpp ``timings`` (``prompt_ms`` + ``predicted_ms``) into seconds.
+def phase_seconds_from_timings(timings) -> tuple[float, float] | None:
+    """Split llama.cpp ``timings`` into ``(prefill_s, generation_s)``.
+
+    prefill    = prompt processing   (``prompt_ms``)
+    generation = answer generation   (``predicted_ms``)
 
     Returns ``None`` when no usable timings are present, so the caller can
     fall back to the job duration.
@@ -31,7 +34,15 @@ def compute_seconds_from_timings(timings) -> float | None:
         predicted_ms = float(timings.get("predicted_ms", 0) or 0)
     except (TypeError, ValueError):
         return None
-    return (prompt_ms + predicted_ms) / 1000.0
+    return prompt_ms / 1000.0, predicted_ms / 1000.0
+
+
+def compute_seconds_from_timings(timings) -> float | None:
+    """Total GPU seconds from llama.cpp timings (prefill + generation)."""
+    phases = phase_seconds_from_timings(timings)
+    if phases is None:
+        return None
+    return phases[0] + phases[1]
 
 
 class LLMClient:
@@ -74,7 +85,11 @@ class LLMClient:
         job.cached_tokens_actual = (usage.get("prompt_tokens_details") or {}).get(
             "cached_tokens"
         )
-        job.compute_seconds_actual = compute_seconds_from_timings(data.get("timings"))
+        phases = phase_seconds_from_timings(data.get("timings"))
+        if phases is not None:
+            job.prefill_seconds_actual = phases[0]
+            job.generation_seconds_actual = phases[1]
+            job.compute_seconds_actual = phases[0] + phases[1]
         return data
 
     @asynccontextmanager

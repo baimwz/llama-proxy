@@ -17,7 +17,17 @@ log = logging.getLogger("llama_proxy.usage")
 
 # Every per-day row carries exactly these counters. Newer versions may add
 # fields (e.g. ``cached``); rows written by older versions lack them.
-_ROW_FIELDS = ("prompt", "completion", "cached", "requests", "compute_seconds")
+_ROW_FIELDS = (
+    "prompt",
+    "completion",
+    "cached",
+    "requests",
+    "compute_seconds",
+    "prefill_seconds",
+    "generation_seconds",
+    "idle_seconds",
+    "energy_wh",
+)
 
 
 def _ensure_row_fields(row: dict) -> None:
@@ -58,7 +68,17 @@ class UsageTracker:
         requests: int = 1,
         cached_tokens: int = 0,
         compute_seconds: float = 0.0,
+        prefill_seconds: float = 0.0,
+        generation_seconds: float = 0.0,
+        idle_seconds: float = 0.0,
+        energy_wh: float = 0.0,
     ) -> None:
+        """Add one accounting entry for `user` today.
+
+        Callers pick the relevant counters, e.g. a finished job records
+        tokens + phase seconds + its share of the energy, while an idle-gap
+        settlement records only ``idle_seconds``/``energy_wh`` (requests=0).
+        """
         day = date.today().isoformat()
         per_user = self._data.setdefault(user, {})
         row = per_user.setdefault(day, {k: 0 for k in _ROW_FIELDS})
@@ -68,6 +88,10 @@ class UsageTracker:
         row["cached"] += int(cached_tokens)
         row["requests"] += int(requests)
         row["compute_seconds"] += float(compute_seconds)
+        row["prefill_seconds"] += float(prefill_seconds)
+        row["generation_seconds"] += float(generation_seconds)
+        row["idle_seconds"] += float(idle_seconds)
+        row["energy_wh"] += float(energy_wh)
 
     def flush(self) -> None:
         try:
@@ -90,7 +114,17 @@ class UsageTracker:
         cutoff = datetime.combine(date.today(), datetime.min.time()).timestamp() - days * 86400
         out: dict[str, dict] = {}
         for user, per_day in self._data.items():
-            agg = {"prompt": 0, "completion": 0, "cached": 0, "requests": 0, "compute_seconds": 0.0}
+            agg = {
+                "prompt": 0,
+                "completion": 0,
+                "cached": 0,
+                "requests": 0,
+                "compute_seconds": 0.0,
+                "prefill_seconds": 0.0,
+                "generation_seconds": 0.0,
+                "idle_seconds": 0.0,
+                "energy_wh": 0.0,
+            }
             for day, row in per_day.items():
                 if self._in_window(day, cutoff):
                     agg["prompt"] += int(row.get("prompt", 0))
@@ -98,7 +132,16 @@ class UsageTracker:
                     agg["cached"] += int(row.get("cached", 0))
                     agg["requests"] += int(row.get("requests", 0))
                     agg["compute_seconds"] += float(row.get("compute_seconds", 0))
+                    agg["prefill_seconds"] += float(row.get("prefill_seconds", 0))
+                    agg["generation_seconds"] += float(row.get("generation_seconds", 0))
+                    agg["idle_seconds"] += float(row.get("idle_seconds", 0))
+                    agg["energy_wh"] += float(row.get("energy_wh", 0))
             agg["compute_seconds"] = round(agg["compute_seconds"], 2)
+            agg["prefill_seconds"] = round(agg["prefill_seconds"], 2)
+            agg["generation_seconds"] = round(agg["generation_seconds"], 2)
+            agg["idle_seconds"] = round(agg["idle_seconds"], 2)
+            # energy is NOT rounded: small jobs are far below one Wh and
+            # rounding to 2 decimals would zero them out
             out[user] = agg
         return out
 
@@ -119,7 +162,10 @@ class UsageTracker:
                 r = {"day": day}
                 for k in _ROW_FIELDS:
                     r[k] = row.get(k, 0)
-                r["compute_seconds"] = round(float(r.get("compute_seconds", 0)), 2)
+                for k in ("compute_seconds", "prefill_seconds", "generation_seconds",
+                          "idle_seconds"):
+                    r[k] = round(float(r.get(k, 0)), 2)
+                # energy_wh keeps full precision (small values must survive)
                 rows.append(r)
             rows.sort(key=lambda x: x["day"])
             out[u] = rows

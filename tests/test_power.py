@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -251,6 +252,155 @@ async def test_idle_watchdog_stays_busy(tmp_path):
     finally:
         task.cancel()
     assert pm.state is ProxyState.READY
+
+
+async def test_idle_gap_equal_split_two_users(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+    settled: list[tuple[float, list[str], float]] = []
+    pm.set_idle_gap_handler(
+        lambda gap, users, share: settled.append((gap, list(users), share))
+    )
+    pm.mark_ready()
+    now = time.time()
+    pm.note_user_activity("anton")        # anton's job just ended
+    pm._last_activity = now - 100         # then the server sat idle for 100 s
+    pm.observe_idle(busy=True)            # still busy -> no gap yet
+    pm.observe_idle(busy=False)           # READY + idle -> gap opens
+    pm.note_user_activity("falko")        # falko's job starts -> gap closes
+    assert len(settled) == 1
+    gap, users, share = settled[0]
+    assert users == ["anton", "falko"]    # equal split among both
+    assert share == pytest.approx(gap / 2)
+    assert 95 <= gap <= 105
+
+
+async def test_idle_gap_single_user_gets_all(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+    settled: list[tuple[float, list[str], float]] = []
+    pm.set_idle_gap_handler(
+        lambda gap, users, share: settled.append((gap, list(users), share))
+    )
+    pm.mark_ready()
+    now = time.time()
+    pm.note_user_activity("anton")
+    pm._last_activity = now - 50
+    pm.observe_idle(busy=False)
+    pm.note_user_activity("anton")        # anton comes back
+    assert len(settled) == 1
+    gap, users, share = settled[0]
+    assert users == ["anton"]
+    assert share == pytest.approx(gap)
+
+
+async def test_idle_gap_without_users_not_attributed(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+    settled: list[tuple[float, list[str], float]] = []
+    pm.set_idle_gap_handler(
+        lambda gap, users, share: settled.append((gap, list(users), share))
+    )
+    pm.mark_ready()
+    pm._last_activity = time.time() - 50
+    pm.observe_idle(busy=False)           # gap opens (e.g. right after boot)
+    pm.observe_idle(busy=True)            # closes again, but no user was active
+    assert settled == []
+
+
+async def test_idle_gap_handler_exception_is_swallowed(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+
+    def boom(gap, users, share):
+        raise RuntimeError("usage store broken")
+
+    pm.set_idle_gap_handler(boom)
+    pm.mark_ready()
+    pm.note_user_activity("anton")
+    pm._last_activity = time.time() - 30
+    pm.observe_idle(busy=False)
+    # must not raise (the power loop must survive a broken handler)
+    pm.note_user_activity("falko")
+    assert not pm._gap_active
+
+
+async def test_shutdown_settles_idle_gap(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(
+        tmp_path, fake,
+        power={"shutdown_verify_timeout_s": 0.2},
+        llm={"base_url": "http://nonexistent.invalid:8080"},
+    )
+    settled: list[tuple[float, list[str], float]] = []
+    pm.set_idle_gap_handler(
+        lambda gap, users, share: settled.append((gap, list(users), share))
+    )
+    off: list[int] = []
+
+    async def power_off() -> None:
+        off.append(1)
+
+    pm.set_backends(power_off=power_off)
+    pm.mark_ready()
+    pm.note_user_activity("anton")
+    pm._last_activity = time.time() - 30
+    pm.observe_idle(busy=False)           # idle gap open
+    await pm.shutdown()                   # must settle the gap before poweroff
+    assert off == [1]
+    assert len(settled) == 1
+    gap, users, share = settled[0]
+    assert users == ["anton"]
+    assert 25 <= gap <= 35
+
+
+async def test_degrade_settles_idle_gap(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+    settled: list[tuple[float, list[str], float]] = []
+    pm.set_idle_gap_handler(
+        lambda gap, users, share: settled.append((gap, list(users), share))
+    )
+    pm.mark_ready()
+    pm.note_user_activity("anton")
+    pm._last_activity = time.time() - 20
+    pm.observe_idle(busy=False)
+    pm.degrade()                          # server died -> gap ends
+    assert len(settled) == 1
+    assert settled[0][1] == ["anton"]
+
+
+async def test_idle_watchdog_triggers_shutdown_and_settles_gap(tmp_path):
+    # end-to-end: the watchdog closes the idle period and attributes it
+    fake = FakeLLM()
+    pm = make_pm(
+        tmp_path, fake,
+        proxy={"idle_timeout_s": 0.1},
+        llm={"base_url": "http://nonexistent.invalid:8080"},
+    )
+    settled: list[tuple[float, list[str], float]] = []
+    pm.set_idle_gap_handler(
+        lambda gap, users, share: settled.append((gap, list(users), share))
+    )
+
+    async def power_off() -> None:
+        pass
+
+    pm.set_backends(power_off=power_off)
+    pm.mark_ready()
+    pm.note_user_activity("anton")
+    task = asyncio.create_task(pm.idle_watchdog(lambda: False, interval=0.05))
+    try:
+        for _ in range(200):
+            if pm.state is ProxyState.OFF:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+    assert pm.state is ProxyState.OFF
+    assert len(settled) == 1
+    assert settled[0][1] == ["anton"]
+    assert settled[0][0] >= 0.1
 
 
 async def test_liveness_marks_off_when_server_dies(tmp_path):

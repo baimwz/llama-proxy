@@ -10,6 +10,8 @@ import pytest
 
 from conftest import chat_payload
 from llama_proxy.llmclient import compute_seconds_from_timings
+from llama_proxy.load import RecentLoad
+from llama_proxy.power import ProxyState
 from llama_proxy.routes_web import resolve_web_identity
 
 
@@ -269,3 +271,135 @@ async def test_daily_shape(app_env):
     row = body["daily"]["anton"][0]
     for field in ("day", "prompt", "completion", "cached", "requests", "compute_seconds"):
         assert field in row
+
+
+# --- recent load (20-min window) --------------------------------------------
+
+
+def test_load_snapshot_aggregation():
+    rl = RecentLoad()
+    now = 1_000_000.0
+    rl.record("anton", 30.0, now=now)
+    rl.record("anton", 10.0, now=now)
+    rl.record("falko", 20.0, now=now)
+    rl.record("ghost", 500.0, now=now - 7200)  # outside any valid window
+    s = rl.snapshot(1200, now=now)
+    assert s["busy_seconds"] == pytest.approx(60.0)
+    assert s["jobs"] == 3
+    assert s["utilization_pct"] == pytest.approx(5.0)  # 60 s / 1200 s
+    assert [u["name"] for u in s["users"]] == ["anton", "falko"]
+    assert s["users"][0]["pct"] == pytest.approx(66.7)
+    assert s["users"][0]["jobs"] == 2
+    assert s["users"][1]["pct"] == pytest.approx(33.3)
+
+
+def test_load_snapshot_empty_and_window_filter():
+    rl = RecentLoad()
+    now = 2_000_000.0
+    assert rl.snapshot(1200, now=now)["users"] == []
+    rl.record("anton", 12.0, now=now - 1500)  # older than the 20-min window
+    s = rl.snapshot(1200, now=now)
+    assert s["jobs"] == 0 and s["busy_seconds"] == 0.0
+
+
+def test_load_snapshot_utilization_capped():
+    rl = RecentLoad()
+    now = 3_000_000.0
+    rl.record("anton", 2000.0, now=now)  # busy > window => cap at 100 %
+    assert rl.snapshot(1200, now=now)["utilization_pct"] == 100.0
+
+
+async def test_usage_recent_endpoint(app_env):
+    app, client = app_env
+    resp = await client.get("/usage/recent")  # open, no key needed
+    assert resp.status == 200
+    assert (await resp.json())["users"] == []
+    app["load"].record("falko", 30.0)
+    resp = await client.get("/usage/recent")
+    body = await resp.json()
+    assert body["busy_seconds"] == pytest.approx(30.0)
+    assert body["jobs"] == 1
+    assert body["users"][0]["name"] == "falko"
+    assert body["users"][0]["pct"] == pytest.approx(100.0)
+
+
+async def test_load_recorded_on_finished_job(app_env):
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+    _, alice = app["keys"].create("alice")
+    resp = await client.post(
+        "/v1/chat/completions", json=chat_payload(),
+        headers={"Authorization": f"Bearer {alice}"},
+    )
+    assert resp.status == 200
+    await _wait_for_usage(app, "alice")
+    s = app["load"].snapshot(1200)
+    assert s["jobs"] == 1
+    assert s["users"][0]["name"] == "alice"
+    assert s["users"][0]["busy_seconds"] == pytest.approx(0.3)
+
+
+# --- shutdown countdown ------------------------------------------------------
+
+
+async def test_status_countdown_fields(app_env):
+    app, client = app_env
+    timeout = app["cfg"].proxy.idle_timeout_s
+    body = await (await client.get("/status")).json()
+    assert body["idle_timeout_s"] == timeout
+    assert 0 <= body["shutdown_in_s"] <= timeout
+    # simulate 300 s of idleness -> the countdown must shrink accordingly
+    app["power"].note_activity()
+    app["power"]._last_activity = time.time() - 300
+    body = await (await client.get("/status")).json()
+    assert body["shutdown_in_s"] == pytest.approx(timeout - 300, abs=2.0)
+
+
+# --- wake button (POST /wake) -------------------------------------------------
+
+
+async def test_wake_noop_when_ready(app_env):
+    app, client = app_env
+    assert app["power"].state is ProxyState.READY  # mock LLM is healthy
+    resp = await client.post("/wake")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["waking"] is False
+    assert app["power"].state is ProxyState.READY
+
+
+async def test_wake_starts_and_completes(app_env):
+    app, client = app_env
+    calls: list[int] = []
+
+    async def fake_wol() -> None:
+        calls.append(1)
+
+    app["power"].set_backends(power_on=fake_wol)
+    app["power"].state = ProxyState.OFF  # simulate a powered-off server
+    resp = await client.post("/wake")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["waking"] is True
+    # the mock LLM is healthy -> the wake task reaches READY right away
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and app["power"].state is not ProxyState.READY:
+        await asyncio.sleep(0.05)
+    assert app["power"].state is ProxyState.READY
+    assert calls  # the WoL magic packet was actually sent
+
+
+async def test_wake_click_twice_starts_single_wake(app_env):
+    app, client = app_env
+
+    async def slow_wol() -> None:
+        await asyncio.sleep(2.0)
+
+    app["power"].set_backends(power_on=slow_wol)
+    app["power"].state = ProxyState.OFF
+    r1 = await client.post("/wake")
+    assert (await r1.json())["waking"] is True
+    first_task = app["power"]._wake_task
+    r2 = await client.post("/wake")  # second click while in flight
+    assert (await r2.json())["waking"] is True
+    assert app["power"]._wake_task is first_task

@@ -18,6 +18,7 @@ from aiohttp import web
 
 from .auth import Auth, Identity, token_from_header
 from .config import Config
+from .power import ProxyState
 from .routes_openai import err
 
 _KEY_HEADER = "Authorization"
@@ -106,12 +107,17 @@ async def status_view(request: web.Request) -> web.Response:
     app = request.app
     power = app["power"]
     active = app["queue"].active()
+    timeout_s = app["cfg"].proxy.idle_timeout_s
     return web.json_response(
         {
             "server_state": power.state.value,
             "up": power.state.value == "ready",
             "model": app["cfg"].llm.model_name,
             "idle_seconds": round(power.idle_seconds, 1),
+            "idle_timeout_s": timeout_s,
+            # countdown to the idle shutdown; the watchdog only fires when
+            # idle >= timeout AND no jobs are active (see power.idle_watchdog)
+            "shutdown_in_s": round(max(0.0, timeout_s - power.idle_seconds), 1),
             "last_boot_s": power.last_boot_s,
             "queue": {
                 "active": len(active),
@@ -119,6 +125,47 @@ async def status_view(request: web.Request) -> web.Response:
                 "queued": app["queue"].pending_count(),
             },
             "server_time": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+
+
+async def usage_recent(request: web.Request) -> web.Response:
+    """Load of the last N seconds (default 1200 = 20 min), open like /status.
+
+    Shows the GPU busy share per user (who causes how much of the load) -
+    relative load, not personal usage data, so it is safe on both pages.
+    """
+    app = request.app
+    try:
+        window = int(request.query.get("window_s", 1200))
+    except (TypeError, ValueError):
+        window = 1200
+    window = max(60, min(3600, window))
+    return web.json_response(app["load"].snapshot(window))
+
+
+async def wake_server(request: web.Request) -> web.Response:
+    """POST: wake the LLM host (WoL) without waiting for the boot to finish.
+
+    Non-blocking by design: booting can take up to boot_timeout_s, which a
+    browser request must not sit through. The status poll (15 s) picks up
+    the state change as soon as the server is READY.
+    """
+    app = request.app
+    power = app["power"]
+    if power.state is ProxyState.READY:
+        return web.json_response(
+            {"state": power.state.value, "waking": False,
+             "message": "Server läuft bereits."}
+        )
+    started = await power.request_wake()
+    return web.json_response(
+        {
+            "state": power.state.value,
+            "waking": True,
+            "message": "Wake-on-LAN gestartet – Server weckt sich auf …"
+            if started
+            else "Wakeup läuft bereits.",
         }
     )
 
@@ -141,7 +188,9 @@ def setup(app: web.Application) -> None:
     app.router.add_get("/", personal_page)
     app.router.add_get("/admin", admin_page)
     app.router.add_get("/usage/me", usage_me)
+    app.router.add_get("/usage/recent", usage_recent)
     app.router.add_get("/status", status_view)
+    app.router.add_post("/wake", wake_server)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +242,10 @@ footer { max-width: 880px; margin: 0 auto; padding: 0 1rem 2rem;
 details { margin: .3rem 0; }
 summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 .dwrap { margin: .5rem 0 .5rem 1rem; }
+.ld-user { margin-bottom: .65rem; }
+.ld-track { height: 10px; background: #eef1f5; border-radius: 6px; overflow: hidden; }
+.ld-bar { height: 100%; background: var(--accent); }
+.ld-label { font-size: .82rem; color: var(--muted); margin-top: .15rem; }
 """
 
 _STATUS_JS = """
@@ -202,6 +255,13 @@ function fmtSecs(s) {
   if (v >= 3600) return (v / 3600).toLocaleString("de-DE", {maximumFractionDigits: 2}) + " h";
   if (v >= 90) return (v / 60).toLocaleString("de-DE", {maximumFractionDigits: 1}) + " min";
   return v.toLocaleString("de-DE", {maximumFractionDigits: 1}) + " s";
+}
+function fmtCountdown(s) {
+  if (s == null) return "–";
+  if (s < 60) return "< 1 min";
+  const m = s / 60;
+  if (m < 120) return m.toLocaleString("de-DE", {maximumFractionDigits: 1}) + " min";
+  return (m / 60).toLocaleString("de-DE", {maximumFractionDigits: 1}) + " h";
 }
 async function api(path, key) {
   const headers = key ? { Authorization: "Bearer " + key } : {};
@@ -217,6 +277,69 @@ function renderStatus(d) {
   document.getElementById("st-idle").textContent = Math.round(d.idle_seconds) + " s";
   document.getElementById("st-boot").textContent =
     d.last_boot_s != null ? "letzte Boot-Zeit: " + fmtSecs(d.last_boot_s) : "–";
+  document.getElementById("st-shutdown").textContent =
+    d.up ? fmtCountdown(d.shutdown_in_s) : "–";
+  const busy = d.queue.active > 0 || d.queue.queued > 0;
+  document.getElementById("st-pause").textContent =
+    d.up && busy ? "· Jobs aktiv – Abschaltung pausiert" : "";
+}
+function renderLoad(d) {
+  const busyEl = document.getElementById("ld-busy");
+  if (!busyEl) return;
+  busyEl.textContent = fmtSecs(d.busy_seconds) + " (" +
+    Number(d.utilization_pct).toLocaleString("de-DE") + " %)";
+  document.getElementById("ld-jobs").textContent = fmtInt(d.jobs);
+  const el = document.getElementById("ld-users");
+  el.innerHTML = "";
+  if (!d.users || !d.users.length) {
+    el.innerHTML = '<p class="muted">Keine Aktivität im Zeitraum.</p>';
+    return;
+  }
+  for (const u of d.users) {
+    const track = document.createElement("div");
+    track.className = "ld-track";
+    const bar = document.createElement("div");
+    bar.className = "ld-bar";
+    bar.style.width = u.pct + "%";
+    track.appendChild(bar);
+    const label = document.createElement("div");
+    label.className = "ld-label";
+    label.textContent = u.name + "  ·  " +
+      Number(u.pct).toLocaleString("de-DE") + " %  ·  " + fmtSecs(u.busy_seconds) +
+      "  ·  " + u.jobs + (u.jobs === 1 ? " Job" : " Jobs");
+    const user = document.createElement("div");
+    user.className = "ld-user";
+    user.appendChild(track);
+    user.appendChild(label);
+    el.appendChild(user);
+  }
+}
+async function refreshShared() {
+  const [rs, rl] = await Promise.all([
+    api("/status"),
+    api("/usage/recent?window_s=1200"),
+  ]);
+  if (rs.ok) renderStatus(await rs.json());
+  if (rl.ok) renderLoad(await rl.json());
+}
+function initWake() {
+  const btn = document.getElementById("wake-btn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    const msg = document.getElementById("wake-msg");
+    msg.textContent = "Starte Wake-on-LAN …";
+    try {
+      const r = await fetch("/wake", { method: "POST" });
+      let b = {};
+      try { b = await r.json(); } catch (e) { /* ignore */ }
+      msg.textContent = (b && b.message) || (r.ok ? "OK" : "Fehler (" + r.status + ")");
+      refreshShared();
+    } catch (e) {
+      msg.textContent = "Fehler: " + e;
+    }
+    btn.disabled = false;
+  });
 }
 """
 
@@ -268,8 +391,7 @@ async function refresh() {
     } catch (e) { /* keep default */ }
     $("login-error").textContent = msg;
   }
-  const rs = await api("/status", null);
-  if (rs.ok) renderStatus(await rs.json());
+  await refreshShared();
 }
 
 $("login-form").addEventListener("submit", (e) => {
@@ -287,6 +409,7 @@ $("days-select").addEventListener("change", (e) => {
   days = Number(e.target.value);
   refresh();
 });
+initWake();
 refresh();
 setInterval(refresh, 15000);
 """
@@ -313,7 +436,25 @@ _PERSONAL_HTML = """<!doctype html>
       <div><span class="k">Queue</span><span id="st-queue">…</span></div>
       <div><span class="k">Idle</span><span id="st-idle">…</span></div>
     </div>
-    <p class="muted" style="margin:.6rem 0 0"><span id="st-boot">–</span></p>
+    <p class="muted" style="margin:.6rem 0 0">
+      <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span>
+    </p>
+    <p style="margin:.7rem 0 0">
+      <button id="wake-btn" type="button">Server wecken</button>
+      <span id="wake-msg" class="muted"></span>
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Auslastung (letzte 20 Min.)</h2>
+    <div class="row">
+      <div><span class="k">GPU-Busy</span><span id="ld-busy">…</span></div>
+      <div><span class="k">Jobs</span><span id="ld-jobs">…</span></div>
+    </div>
+    <div id="ld-users" style="margin-top:.5rem"></div>
+    <p class="muted" style="margin:.6rem 0 0">
+      Anteil an der GPU-Berechnungszeit im Zeitraum (Live-Wert, kein Verlauf).
+    </p>
   </section>
 
   <section class="card" id="usage-card" hidden>
@@ -433,8 +574,7 @@ async function refresh() {
     setLoginVisible(false);
     $("admin-error").textContent = "";
   }
-  const rs = await api("/status", null);
-  if (rs.ok) renderStatus(await rs.json());
+  await refreshShared();
 }
 
 $("login-form").addEventListener("submit", (e) => {
@@ -452,6 +592,7 @@ $("days-select").addEventListener("change", (e) => {
   days = Number(e.target.value);
   refresh();
 });
+initWake();
 refresh();
 setInterval(refresh, 15000);
 """
@@ -478,7 +619,25 @@ _ADMIN_HTML = """<!doctype html>
       <div><span class="k">Queue</span><span id="st-queue">…</span></div>
       <div><span class="k">Idle</span><span id="st-idle">…</span></div>
     </div>
-    <p class="muted" style="margin:.6rem 0 0"><span id="st-boot">–</span></p>
+    <p class="muted" style="margin:.6rem 0 0">
+      <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span>
+    </p>
+    <p style="margin:.7rem 0 0">
+      <button id="wake-btn" type="button">Server wecken</button>
+      <span id="wake-msg" class="muted"></span>
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Auslastung (letzte 20 Min.)</h2>
+    <div class="row">
+      <div><span class="k">GPU-Busy</span><span id="ld-busy">…</span></div>
+      <div><span class="k">Jobs</span><span id="ld-jobs">…</span></div>
+    </div>
+    <div id="ld-users" style="margin-top:.5rem"></div>
+    <p class="muted" style="margin:.6rem 0 0">
+      Anteil an der GPU-Berechnungszeit im Zeitraum (Live-Wert, kein Verlauf).
+    </p>
   </section>
 
   <div id="data-cards">

@@ -13,6 +13,7 @@ from .config import Config
 from .conversation import ConversationTracker
 from .keys import KeyStore
 from .llmclient import LLMClient
+from .load import RecentLoad
 from .metrics import Metrics
 from .power import PowerManager
 from .ratelimit import RateLimiter
@@ -44,6 +45,7 @@ def create_app(cfg: Config) -> web.Application:
     app["llm"] = LLMClient(cfg.llm)
     app["power"] = PowerManager(cfg, app["llm"].health, app["tracker"], metrics)
     app["queue"] = JobQueue()
+    app["load"] = RecentLoad()
     app["usage"] = UsageTracker(cfg.usage.data_dir, cfg.usage.flush_interval_s)
     app["keys"] = KeyStore(
         Path(cfg.usage.data_dir) / "keys.json",
@@ -56,7 +58,7 @@ def create_app(cfg: Config) -> web.Application:
     app["auth"] = Auth(app["keys"], app["limiter"], app["usage"])
     app["scheduler"] = Scheduler(
         cfg, app["queue"], app["llm"], app["power"], app["tracker"],
-        app["counter"], app["usage"], metrics,
+        app["counter"], app["usage"], app["load"], metrics,
     )
 
     # live gauges

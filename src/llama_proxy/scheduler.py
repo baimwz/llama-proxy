@@ -19,6 +19,7 @@ import httpx
 from .config import Config
 from .conversation import ConversationTracker
 from .llmclient import LLMClient, LLMError, compute_seconds_from_timings
+from .load import RecentLoad
 from .metrics import Metrics
 from .power import PowerManager, ProxyState
 from .state import END, Job, JobCancelled, JobQueue, JobState
@@ -72,6 +73,7 @@ class Scheduler:
         tracker: ConversationTracker,
         counter: TokenCounter,
         usage: UsageTracker,
+        load: RecentLoad,
         metrics: Metrics,
     ) -> None:
         self._cfg = cfg
@@ -81,6 +83,7 @@ class Scheduler:
         self._tracker = tracker
         self._counter = counter
         self._usage = usage
+        self._load = load
         self._metrics = metrics
         self._wake = asyncio.Event()
 
@@ -274,3 +277,5 @@ class Scheduler:
                 job.user, p_tok, c_tok, cached_tokens=cached_tok,
                 compute_seconds=compute_s or 0.0,
             )
+            # same value as the usage tracker - single source of truth
+            self._load.record(job.user, compute_s or 0.0)

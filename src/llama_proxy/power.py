@@ -205,6 +205,34 @@ class PowerManager:
 
     # -- readiness ----------------------------------------------------------
 
+    def _log_wake_failure(self, task: asyncio.Task) -> None:
+        """Done-callback so a fire-and-forget wake failure is logged instead
+        of surfacing as 'exception was never retrieved'."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("wake failed: %s", exc)
+
+    async def request_wake(self) -> bool:
+        """Kick off a wake and return immediately (non-blocking).
+
+        Returns True if a wake is now running (just started or already in
+        flight), False if the server is already READY. For the web UI
+        button; request paths keep using ``ensure_ready``, which also awaits
+        the result.
+        """
+        if self.state is ProxyState.READY:
+            return False
+        async with self._lock:
+            if self.state is ProxyState.READY:
+                return False
+            if self._wake_task is None or self._wake_task.done():
+                task = asyncio.create_task(self._do_wake())
+                task.add_done_callback(self._log_wake_failure)
+                self._wake_task = task
+        return True
+
     async def ensure_ready(self) -> None:
         """Wait until the LLM server answers health checks; wake it if needed."""
         if self.state is ProxyState.READY:

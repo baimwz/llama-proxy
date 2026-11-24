@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from llama_proxy.config import Config
 from llama_proxy.conversation import ConversationTracker
+from llama_proxy.load import RecentLoad
 from llama_proxy.metrics import Metrics
 from llama_proxy.power import PowerManager, ProxyState
 from llama_proxy.scheduler import Scheduler
@@ -47,7 +48,9 @@ def make(**cfg_over) -> tuple[Scheduler, JobQueue, PowerManager]:
     usage = UsageTracker(tempfile.mkdtemp(prefix="lp-test-"), 60)
     power = PowerManager(cfg, llm.health, tracker, Metrics())
     power.mark_ready()
-    sched = Scheduler(cfg, queue, llm, power, tracker, counter, usage, Metrics())
+    sched = Scheduler(
+        cfg, queue, llm, power, tracker, counter, usage, RecentLoad(), Metrics()
+    )
     return sched, queue, power
 
 

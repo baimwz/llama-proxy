@@ -319,62 +319,80 @@ async def test_daily_shape(app_env):
         assert field in row
 
 
-# --- recent load (20-min window) --------------------------------------------
+# --- recent load (12 h graph) -------------------------------------------------
 
 
-def test_load_snapshot_aggregation():
+def test_load_graph_aggregation():
     rl = RecentLoad()
+    bucket = 300.0
     now = 1_000_000.0
-    rl.record("anton", 30.0, now=now)
-    rl.record("anton", 10.0, now=now)
-    rl.record("falko", 20.0, now=now)
-    rl.record("ghost", 500.0, now=now - 7200)  # outside any valid window
-    s = rl.snapshot(1200, now=now)
-    assert s["busy_seconds"] == pytest.approx(60.0)
-    assert s["jobs"] == 3
-    assert s["utilization_pct"] == pytest.approx(5.0)  # 60 s / 1200 s
-    assert [u["name"] for u in s["users"]] == ["anton", "falko"]
-    # per-user pct = GPU utilization within the window (busy / window),
-    # NOT the share of total busy time (a single user would always be 100%)
-    assert s["users"][0]["pct"] == pytest.approx(3.3)  # 40 s / 1200 s
-    assert s["users"][0]["jobs"] == 2
-    assert s["users"][1]["pct"] == pytest.approx(1.7)  # 20 s / 1200 s
+    boundary = (int(now) // bucket + 1) * bucket
+    rl.record("anton", 30.0, now=now)                  # current bucket
+    rl.record("falko", 60.0, now=boundary - bucket - 1)  # previous bucket
+    rl.record("leo", 90.0, now=boundary - 2 * bucket - 1)  # outside the window
+    g = rl.graph(2 * bucket, bucket, now=now)
+    assert g["window_s"] == 2 * bucket
+    assert g["bucket_s"] == bucket
+    assert len(g["buckets"]) == 2
+    assert g["buckets"][0]["busy_seconds"] == pytest.approx(60.0)
+    assert g["buckets"][1]["busy_seconds"] == pytest.approx(30.0)
+    assert g["busy_seconds"] == pytest.approx(90.0)
+    assert g["jobs"] == 2
+    assert g["buckets"][0]["utilization_pct"] == pytest.approx(20.0)  # 60/300
+    assert g["buckets"][1]["utilization_pct"] == pytest.approx(10.0)  # 30/300
+    # bucket boundaries are stable between polls (aligned to the bucket size)
+    for b in g["buckets"]:
+        assert b["start"] % bucket == 0
+    # total only: no per-user breakdown in the public graph
+    assert "users" not in g
 
 
-def test_load_snapshot_empty_and_window_filter():
+def test_load_graph_empty_and_window_filter():
     rl = RecentLoad()
     now = 2_000_000.0
-    assert rl.snapshot(1200, now=now)["users"] == []
-    rl.record("anton", 12.0, now=now - 1500)  # older than the 20-min window
-    s = rl.snapshot(1200, now=now)
-    assert s["jobs"] == 0 and s["busy_seconds"] == 0.0
+    g = rl.graph(43200, 300, now=now)
+    assert g["busy_seconds"] == 0.0 and g["jobs"] == 0
+    rl.record("anton", 12.0, now=now - 1500)
+    g = rl.graph(600, 300, now=now)   # 10-min window: the job is too old
+    assert g["jobs"] == 0 and g["busy_seconds"] == 0.0
+    g = rl.graph(1800, 300, now=now)  # 30-min window: the job counts
+    assert g["jobs"] == 1 and g["busy_seconds"] == pytest.approx(12.0)
 
 
-def test_load_snapshot_utilization_capped():
+def test_load_graph_utilization_capped():
     rl = RecentLoad()
     now = 3_000_000.0
-    rl.record("anton", 2000.0, now=now)  # busy > window => cap at 100 %
-    s = rl.snapshot(1200, now=now)
-    assert s["utilization_pct"] == 100.0
-    # per-user pct is capped at 100 % as well (a single user is not "100%
-    # of the busy time" but "their share of the window")
-    assert s["users"][0]["pct"] == 100.0
+    rl.record("anton", 300.0, now=now)  # one full 5-min bucket of busy time
+    g = rl.graph(300, 300, now=now)
+    assert g["buckets"][-1]["utilization_pct"] == 100.0
+    assert g["utilization_pct"] == 100.0
+
+
+def test_load_graph_prunes_beyond_retention():
+    rl = RecentLoad()
+    now = 4_000_000.0
+    rl.record("anton", 30.0, now=now - 13 * 3600)  # older than the 12 h retention
+    g = rl.graph(43200, 300, now=now)
+    assert g["busy_seconds"] == 0.0
+    assert g["jobs"] == 0
 
 
 async def test_usage_recent_endpoint(app_env):
     app, client = app_env
     resp = await client.get("/usage/recent")  # open, no key needed
     assert resp.status == 200
-    assert (await resp.json())["users"] == []
-    app["load"].record("falko", 30.0)
-    resp = await client.get("/usage/recent")
     body = await resp.json()
+    n = body["window_s"] // body["bucket_s"]
+    assert len(body["buckets"]) == n
+    assert body["busy_seconds"] == 0.0
+    assert "users" not in body  # total only: identical for everyone
+    app["load"].record("falko", 30.0)
+    body = await (await client.get("/usage/recent")).json()
     assert body["busy_seconds"] == pytest.approx(30.0)
     assert body["jobs"] == 1
-    assert body["users"][0]["name"] == "falko"
-    # pct = GPU utilization within the window (30 s / 1200 s), not 100 %
-    # just because falko is the only user
-    assert body["users"][0]["pct"] == pytest.approx(2.5)
+    last = body["buckets"][-1]
+    assert last["busy_seconds"] == pytest.approx(30.0)
+    assert last["utilization_pct"] == pytest.approx(10.0)  # 30 s / 300 s bucket
 
 
 async def test_load_recorded_on_finished_job(app_env):
@@ -387,10 +405,10 @@ async def test_load_recorded_on_finished_job(app_env):
     )
     assert resp.status == 200
     await _wait_for_usage(app, "alice")
-    s = app["load"].snapshot(1200)
-    assert s["jobs"] == 1
-    assert s["users"][0]["name"] == "alice"
-    assert s["users"][0]["busy_seconds"] == pytest.approx(0.3)
+    g = app["load"].graph(43200, 300)
+    assert g["jobs"] == 1
+    assert g["busy_seconds"] == pytest.approx(0.3)
+    assert g["buckets"][-1]["busy_seconds"] == pytest.approx(0.3)
 
 
 # --- shutdown countdown ------------------------------------------------------

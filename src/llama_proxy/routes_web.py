@@ -157,18 +157,24 @@ async def status_view(request: web.Request) -> web.Response:
 
 
 async def usage_recent(request: web.Request) -> web.Response:
-    """Load of the last N seconds (default 1200 = 20 min), open like /status.
+    """Load of the last 12 hours (rolling), open like /status.
 
-    Shows the GPU busy share per user (who causes how much of the load) -
-    relative load, not personal usage data, so it is safe on both pages.
+    Total GPU utilization as 5-minute buckets - identical for everyone and
+    deliberately without a per-user split (Anton: "nur die
+    Gesamtauslastung abbilden").
     """
     app = request.app
     try:
-        window = int(request.query.get("window_s", 1200))
+        window = int(request.query.get("window_s", 43200))
     except (TypeError, ValueError):
-        window = 1200
-    window = max(60, min(3600, window))
-    return web.json_response(app["load"].snapshot(window))
+        window = 43200
+    window = max(1800, min(43200, window))  # 12 h = retention of the ring buffer
+    try:
+        bucket = int(request.query.get("bucket_s", 300))
+    except (TypeError, ValueError):
+        bucket = 300
+    bucket = max(60, min(3600, bucket))
+    return web.json_response(app["load"].graph(window, bucket))
 
 
 async def wake_server(request: web.Request) -> web.Response:
@@ -342,10 +348,13 @@ footer { max-width: 880px; margin: 0 auto; padding: 0 1rem 2rem;
 details { margin: .3rem 0; }
 summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 .dwrap { margin: .5rem 0 .5rem 1rem; }
-.ld-user { margin-bottom: .65rem; }
-.ld-track { height: 10px; background: #eef1f5; border-radius: 6px; overflow: hidden; }
-.ld-bar { height: 100%; background: var(--accent); }
-.ld-label { font-size: .82rem; color: var(--muted); margin-top: .15rem; }
+.lg-track { display: flex; align-items: flex-end; gap: 1px; height: 120px;
+            border: 1px solid var(--line); border-radius: 6px; padding: 2px; }
+.lg-cell { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; }
+.lg-bar { width: 100%; background: var(--accent); border-radius: 1px 1px 0 0; }
+.lg-axis { position: relative; height: 1.1em; margin-top: .25rem; }
+.lg-label { position: absolute; transform: translateX(-50%); font-size: .7rem;
+            color: var(--muted); white-space: nowrap; }
 .dist-track { display: flex; height: 14px; border-radius: 7px; overflow: hidden;
               background: #eef1f5; }
 .dist-seg { height: 100%; min-width: 0; }
@@ -428,36 +437,48 @@ function paintStatus() {
   }
 }
 setInterval(paintStatus, 1000); // 1-s tick; each poll re-anchors the values
-function renderLoad(d) {
+function renderGraph(d) {
   const busyEl = document.getElementById("ld-busy");
   if (!busyEl) return;
   busyEl.textContent = fmtSecs(d.busy_seconds) + " (" +
     Number(d.utilization_pct).toLocaleString("de-DE") + " %)";
   document.getElementById("ld-jobs").textContent = fmtInt(d.jobs);
-  const el = document.getElementById("ld-users");
+  const el = document.getElementById("ld-graph");
   el.innerHTML = "";
-  if (!d.users || !d.users.length) {
+  const buckets = d.buckets || [];
+  if (!buckets.length) {
     el.innerHTML = '<p class="muted">Keine Aktivität im Zeitraum.</p>';
     return;
   }
-  for (const u of d.users) {
-    const track = document.createElement("div");
-    track.className = "ld-track";
+  const n = buckets.length;
+  const track = document.createElement("div");
+  track.className = "lg-track";
+  const axis = document.createElement("div");
+  axis.className = "lg-axis";
+  for (let i = 0; i < n; i++) {
+    const b = buckets[i];
+    const cell = document.createElement("div");
+    cell.className = "lg-cell";
     const bar = document.createElement("div");
-    bar.className = "ld-bar";
-    bar.style.width = u.pct + "%";
-    track.appendChild(bar);
-    const label = document.createElement("div");
-    label.className = "ld-label";
-    label.textContent = u.name + "  ·  " +
-      Number(u.pct).toLocaleString("de-DE") + " %  ·  " + fmtSecs(u.busy_seconds) +
-      "  ·  " + u.jobs + (u.jobs === 1 ? " Job" : " Jobs");
-    const user = document.createElement("div");
-    user.className = "ld-user";
-    user.appendChild(track);
-    user.appendChild(label);
-    el.appendChild(user);
+    bar.className = "lg-bar";
+    bar.style.height = Math.max(0, Math.min(100, Number(b.utilization_pct) || 0)) + "%";
+    cell.appendChild(bar);
+    track.appendChild(cell);
+    // hour marks every 2 h: the label sits at the boundary position inside
+    // the bucket that contains it (works for any bucket size)
+    const boundary = (Math.floor(b.start / 7200) + 1) * 7200;
+    if (boundary > b.start && boundary <= b.start + d.bucket_s) {
+      const lab = document.createElement("span");
+      lab.className = "lg-label";
+      const t = new Date(boundary * 1000);
+      lab.textContent = String(t.getHours()).padStart(2, "0") + ":" +
+        String(t.getMinutes()).padStart(2, "0");
+      lab.style.left = ((i + (boundary - b.start) / d.bucket_s) / n * 100) + "%";
+      axis.appendChild(lab);
+    }
   }
+  el.appendChild(track);
+  el.appendChild(axis);
 }
 // Distribution bar: today's server-on time split into Prefill / Generation
 // / Idle. Widths are shares of (prefill + generation + idle), so time with
@@ -491,10 +512,10 @@ function renderDist(t) {
 async function refreshShared() {
   const [rs, rl] = await Promise.all([
     api("/status"),
-    api("/usage/recent?window_s=1200"),
+    api("/usage/recent?window_s=43200&bucket_s=300"),
   ]);
   if (rs.ok) renderStatus(await rs.json());
-  if (rl.ok) renderLoad(await rl.json());
+  if (rl.ok) renderGraph(await rl.json());
 }
 function initActionBtn(btnId, url, label) {
   const btn = document.getElementById(btnId);
@@ -686,15 +707,15 @@ _PERSONAL_HTML = """<!doctype html>
   </section>
 
   <section class="card">
-    <h2>Auslastung (letzte 20 Min.)</h2>
+    <h2>Auslastung (letzte 12 Std.)</h2>
     <div class="row">
       <div><span class="k">GPU-Busy</span><span id="ld-busy">…</span></div>
       <div><span class="k">Jobs</span><span id="ld-jobs">…</span></div>
     </div>
-    <div id="ld-users" style="margin-top:.5rem"></div>
+    <div id="ld-graph" style="margin-top:.5rem"></div>
     <p class="muted" style="margin:.6rem 0 0">
-      GPU-Auslastung im Zeitraum: Busy-Sekunden des Nutzers ÷ Fenster
-      (max. 100 %) — Live-Wert, kein Verlauf.
+      GPU-Auslastung je 5-Minuten-Bucket (Busy-Sekunden ÷ 5 min, max. 100 %)
+      über die letzten 12 Stunden – alle Nutzer zusammen, rollierendes Fenster.
     </p>
   </section>
 
@@ -910,15 +931,15 @@ _ADMIN_HTML = """<!doctype html>
   </section>
 
   <section class="card">
-    <h2>Auslastung (letzte 20 Min.)</h2>
+    <h2>Auslastung (letzte 12 Std.)</h2>
     <div class="row">
       <div><span class="k">GPU-Busy</span><span id="ld-busy">…</span></div>
       <div><span class="k">Jobs</span><span id="ld-jobs">…</span></div>
     </div>
-    <div id="ld-users" style="margin-top:.5rem"></div>
+    <div id="ld-graph" style="margin-top:.5rem"></div>
     <p class="muted" style="margin:.6rem 0 0">
-      GPU-Auslastung im Zeitraum: Busy-Sekunden des Nutzers ÷ Fenster
-      (max. 100 %) — Live-Wert, kein Verlauf.
+      GPU-Auslastung je 5-Minuten-Bucket (Busy-Sekunden ÷ 5 min, max. 100 %)
+      über die letzten 12 Stunden – alle Nutzer zusammen, rollierendes Fenster.
     </p>
   </section>
 

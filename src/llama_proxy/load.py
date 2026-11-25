@@ -1,8 +1,12 @@
-"""In-memory rolling window of recent job load (per user, per job).
+"""In-memory rolling window of recent job load (total GPU busy time).
 
-Feeds the "Auslastung (letzte 20 Min.)" card on the web pages. Not
+Feeds the "Auslastung (letzte 12 Std.)" graph on the web pages. Not
 persisted: after a proxy restart the window starts empty, which is the
 honest state for a live indicator.
+
+The graph is the same for everyone and covers total utilization only
+(Anton: "bei allen gleich aussehen und nur die Gesamtauslastung abbilden"):
+per-user data is deliberately not exposed.
 """
 from __future__ import annotations
 
@@ -10,9 +14,9 @@ import time
 from collections import deque
 
 # Entries older than this can never be part of a valid window again (the
-# endpoint clamps to 3600 s), so they are dropped; MAX_ENTRIES bounds
-# memory under pathological load.
-PRUNE_AGE_S = 3600.0
+# endpoint clamps the window to 43200 s = 12 h), so they are dropped;
+# MAX_ENTRIES bounds memory under pathological load.
+PRUNE_AGE_S = 43200.0
 MAX_ENTRIES = 20000
 
 
@@ -20,8 +24,10 @@ class RecentLoad:
     """Rolling record of finished jobs: (finished_at, user, compute_seconds).
 
     ``record`` is called by the scheduler when a job finishes (with the
-    same compute_seconds that go into the usage tracker), ``snapshot``
-    aggregates whatever falls inside a window for display.
+    same compute_seconds that go into the usage tracker); ``graph``
+    aggregates whatever falls inside a window into fixed-size buckets for
+    display. The user field is kept only so ``record``'s call sites stay
+    unchanged - the public graph never breaks down per user.
     """
 
     def __init__(self) -> None:
@@ -40,52 +46,41 @@ class RecentLoad:
         while self._items and self._items[0][0] < cutoff:
             self._items.popleft()
 
-    def snapshot(self, window_s: float, now: float | None = None) -> dict:
-        """Aggregate all jobs finished within the last `window_s` seconds.
+    def graph(self, window_s: float, bucket_s: float, now: float | None = None) -> dict:
+        """Total GPU load over a rolling window as fixed-size buckets.
 
-        ``busy_seconds`` is the sum of GPU compute time in the window;
-        ``utilization_pct`` is that as a share of the window wall-clock
-        (capped at 100); ``users`` lists every user's busy time, where
-        ``pct`` is the user's GPU utilization within the window
-        (busy_seconds ÷ window, capped at 100 — a single busy user is
-        not "100% of the busy time" but "their share of the window"),
-        sorted by busy_seconds descending.
+        Buckets are aligned to the epoch, so their boundaries are stable
+        between polls (a job lands in the same bucket on every refresh).
+        The current, still-open bucket is reported as-is: that is the
+        honest "rounded" behaviour for a live indicator. ``utilization_pct``
+        is busy time as a share of the period, capped at 100 %.
         """
         now = time.time() if now is None else now
         self._prune(now)
-        cutoff = now - window_s
-        busy = 0.0
+        n = max(1, int(round(window_s / bucket_s)))
+        end = (int(now) // bucket_s + 1) * bucket_s
+        start = end - n * bucket_s
+        busy = [0.0] * n
         jobs = 0
-        per_user: dict[str, dict] = {}
-        for ts, user, secs in self._items:
-            if ts < cutoff:
+        for ts, _user, secs in self._items:
+            if ts < start:
                 continue
-            busy += secs
+            busy[min(n - 1, int((ts - start) // bucket_s))] += secs
             jobs += 1
-            u = per_user.setdefault(user, {"busy_seconds": 0.0, "jobs": 0})
-            u["busy_seconds"] += secs
-            u["jobs"] += 1
-        users = sorted(
-            (
-                {
-                    "name": name,
-                    "busy_seconds": round(u["busy_seconds"], 3),
-                    "pct": round(min(100.0, 100.0 * u["busy_seconds"] / window_s), 1)
-                    if window_s > 0
-                    else 0.0,
-                    "jobs": u["jobs"],
-                }
-                for name, u in per_user.items()
-            ),
-            key=lambda u: u["busy_seconds"],
-            reverse=True,
-        )
+        total = sum(busy)
+        period = n * bucket_s
         return {
-            "window_s": int(window_s),
-            "busy_seconds": round(busy, 3),
-            "utilization_pct": round(min(100.0, 100.0 * busy / window_s), 1)
-            if window_s > 0
-            else 0.0,
+            "window_s": period,
+            "bucket_s": bucket_s,
+            "busy_seconds": round(total, 3),
+            "utilization_pct": round(min(100.0, 100.0 * total / period), 1),
             "jobs": jobs,
-            "users": users,
+            "buckets": [
+                {
+                    "start": start + i * bucket_s,
+                    "busy_seconds": round(v, 3),
+                    "utilization_pct": round(min(100.0, 100.0 * v / bucket_s), 1),
+                }
+                for i, v in enumerate(busy)
+            ],
         }

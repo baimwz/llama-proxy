@@ -171,6 +171,10 @@ class PowerManager:
         self._power_off: Callable[[], Awaitable[None]] | None = None
         # Idle-gap attribution (per-user idle time + energy):
         self._user_activity: dict[str, float] = {}  # user -> last activity (wall clock)
+        # Stop intents: users who asked for a shutdown via the
+        # "Server abschalten" button. A new job by the same user cancels
+        # their intent (see ``note_user_activity``).
+        self._stop_intents: dict[str, float] = {}  # user -> wall clock of the request
         self._idle_gap_handler: Callable[[float, list[str], float], None] | None = None
         self._gap_active = False
         self._gap_start = 0.0
@@ -196,6 +200,11 @@ class PowerManager:
         ends the "server on but idle" period.
         """
         self.note_activity()
+        # using the server again means the user wants it to stay on:
+        # their earlier "Server abschalten" consent is void
+        if user in self._stop_intents:
+            log.info("new activity by %s cancels their stop intent", user)
+        self._stop_intents.pop(user, None)
         self._user_activity[user] = time.time()
         if self._gap_active:
             self._close_gap(time.time() - self._gap_start)
@@ -275,6 +284,7 @@ class PowerManager:
         """Server stopped responding (powered off / crashed) -> back to OFF."""
         self._close_gap(time.time() - self._gap_start)
         self.state = ProxyState.OFF
+        self._stop_intents.clear()  # server is off: consents are meaningless
         self._tracker.invalidate()
 
     def mark_ready(self) -> None:
@@ -283,6 +293,41 @@ class PowerManager:
         # the server only became available now: idle counting (and any idle
         # gap) starts from here, not from before the boot
         self.note_activity()
+        # a fresh boot invalidates shutdown consents from before the off-period
+        self._stop_intents.clear()
+
+    # -- stop intents ("Server abschalten") ----------------------------------
+
+    def request_stop(self, user: str) -> None:
+        """Record a shutdown request by `user` (the "Server abschalten" button).
+
+        The watchdog then powers the server off as soon as *every* user that
+        is still active within the idle window has consented as well (or no
+        user is active) and no jobs are queued or running. A new job by the
+        same user cancels their intent - using the server again means they
+        want it to stay on (see ``note_user_activity``).
+        """
+        self._stop_intents[user] = time.time()
+        log.info(
+            "stop requested by %s (consented: %s)",
+            user,
+            ", ".join(sorted(self._stop_intents)),
+        )
+
+    def active_users_within(self, window_s: float) -> list[str]:
+        """Users that were active within the last `window_s` seconds."""
+        now = time.time()
+        return sorted(u for u, t in self._user_activity.items() if now - t <= window_s)
+
+    def stop_blocked_by(self, window_s: float) -> list[str]:
+        """Active users (idle window) that have NOT requested a shutdown."""
+        consented = set(self._stop_intents)
+        return [u for u in self.active_users_within(window_s) if u not in consented]
+
+    @property
+    def stop_pending(self) -> bool:
+        """True while at least one stop intent is registered."""
+        return bool(self._stop_intents)
 
     # -- readiness ----------------------------------------------------------
 
@@ -414,6 +459,7 @@ class PowerManager:
             log.warning("off-verification failed (assuming off): %s", exc)
         self._tracker.invalidate()
         self.state = ProxyState.OFF
+        self._stop_intents.clear()  # the request was fulfilled: consent is spent
         self._metrics.shutdowns_total.inc()
         log.info("server powered off")
 
@@ -470,12 +516,30 @@ class PowerManager:
                         self.degrade()
                         failures = 0
                         continue
+            window = self._cfg.proxy.idle_timeout_s
+            consented = sorted(self._stop_intents)
+            blocked = self.stop_blocked_by(window) if consented else []
+            early_stop = bool(consented) and not blocked
+            # normal idle timeout, OR early shutdown: everyone active within
+            # the window pressed "Server abschalten" (and nothing is running)
             if (
                 self.state is ProxyState.READY
                 and not busy
-                and self.idle_seconds >= self._cfg.proxy.idle_timeout_s
+                and (self.idle_seconds >= window or early_stop)
             ):
-                log.info("idle timeout reached (%.0fs); shutting server down", self.idle_seconds)
+                if early_stop and self.idle_seconds < window:
+                    log.info(
+                        "shutdown consented by %s; shutting server down "
+                        "(idle %.0fs, window %.0fs)",
+                        ", ".join(consented),
+                        self.idle_seconds,
+                        window,
+                    )
+                else:
+                    log.info(
+                        "idle timeout reached (%.0fs); shutting server down",
+                        self.idle_seconds,
+                    )
                 await self.shutdown()
 
     # -- lifecycle ----------------------------------------------------------

@@ -140,6 +140,10 @@ async def status_view(request: web.Request) -> web.Response:
             "idle_seconds": round(idle_s, 1),
             "idle_timeout_s": timeout_s,
             "shutdown_in_s": round(shutdown_in_s, 1),
+            # "Server abschalten": stop intents + who still has to consent
+            # (users active within the idle window, sorted)
+            "stop_pending": power.stop_pending,
+            "stop_waiting_for": power.stop_blocked_by(timeout_s),
             "last_boot_s": power.last_boot_s,
             "queue": {
                 "active": len(active),
@@ -211,6 +215,58 @@ async def reset_idle(request: web.Request) -> web.Response:
     )
 
 
+async def stop_server(request: web.Request) -> web.Response:
+    """POST: request a shutdown (the "Server abschalten" button).
+
+    Identity required (key or LAN fallback, fail closed - unlike /wake this
+    turns the server OFF): the consent is attributed to a concrete user, and
+    anonymous tailnet clients must not be able to switch off the shared
+    server.
+
+    The watchdog powers the server off on its next tick (a few seconds) as
+    soon as nothing is queued/running AND every user active within the idle
+    window has consented as well. New activity by a consenting user cancels
+    their intent (see PowerManager.note_user_activity).
+    """
+    app = request.app
+    power = app["power"]
+    token = token_from_header(request.headers.get(_KEY_HEADER, ""))
+    ident = resolve_web_identity(app["auth"], app["cfg"], token, request.remote)
+    if ident is None:
+        return err(
+            "kein Key – bitte anmelden (Key wird lokal im Browser gespeichert) "
+            "oder aus dem LAN abrufen",
+            401,
+            login_required=True,
+        )
+    if power.state is not ProxyState.READY:
+        return web.json_response(
+            {
+                "ok": True,
+                "immediate": False,
+                "waiting_for": [],
+                "message": "Server ist ohnehin ausgeschaltet – nichts zu tun.",
+            }
+        )
+    power.request_stop(ident.name)
+    waiting = power.stop_blocked_by(app["cfg"].proxy.idle_timeout_s)
+    if waiting:
+        message = "Stopp angemeldet – warte auf: " + ", ".join(waiting)
+    else:
+        message = (
+            "Stopp angemeldet – Server geht in wenigen Sekunden aus "
+            "(nach den laufenden Jobs)."
+        )
+    return web.json_response(
+        {
+            "ok": True,
+            "immediate": not waiting,
+            "waiting_for": waiting,
+            "message": message,
+        }
+    )
+
+
 async def personal_page(request: web.Request) -> web.Response:
     resp = web.Response(
         text=PERSONAL_HTML, content_type="text/html", charset="utf-8"
@@ -233,6 +289,7 @@ def setup(app: web.Application) -> None:
     app.router.add_get("/status", status_view)
     app.router.add_post("/wake", wake_server)
     app.router.add_post("/reset-idle", reset_idle)
+    app.router.add_post("/stop", stop_server)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +331,7 @@ button { padding: .55rem .9rem; font-size: .95rem; border-radius: 8px;
          border: 1px solid var(--accent); background: var(--accent); color: #fff;
          cursor: pointer; }
 button.secondary { background: #fff; color: var(--ink); border-color: var(--line); }
+button.danger { background: var(--bad); border-color: var(--bad); }
 .error { color: var(--bad); min-height: 1.2em; }
 .muted { color: var(--muted); }
 select { padding: .4rem .5rem; border: 1px solid var(--line); border-radius: 8px;
@@ -357,6 +415,17 @@ function paintStatus() {
     d.up ? fmtMMSS(shutdown) : "–";
   document.getElementById("st-pause").textContent =
     d.up && busy ? "· Jobs aktiv – Idle-Zeit und Abschaltung pausiert" : "";
+  const stopEl = document.getElementById("st-stop");
+  if (stopEl) {
+    if (d.stop_pending) {
+      stopEl.textContent =
+        d.stop_waiting_for && d.stop_waiting_for.length
+          ? " · Stopp: warte auf " + d.stop_waiting_for.join(", ")
+          : " · Stopp angemeldet – Server geht gleich aus";
+    } else {
+      stopEl.textContent = "";
+    }
+  }
 }
 setInterval(paintStatus, 1000); // 1-s tick; each poll re-anchors the values
 function renderLoad(d) {
@@ -450,6 +519,36 @@ function initWake() {
   initActionBtn("wake-btn", "/wake", "Starte Wake-on-LAN");
   initActionBtn("idle-reset-btn", "/reset-idle", "Setze Abschaltung zurück");
 }
+// "Server abschalten": unlike /wake and /reset-idle this turns the server
+// OFF, so an identity is required: the stored key (if any) is sent, and in
+// the LAN the server-side fallback identity (anton) applies.
+function initStop() {
+  const btn = document.getElementById("stop-btn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    if (!confirm("Soll der LLM-Server abgeschaltet werden?\\n\\n" +
+      "Läuft gerade ein Job, geht der Server erst danach aus.\\n" +
+      "Ist noch ein anderer Nutzer im 20-Minuten-Fenster aktiv, muss " +
+      "er den Stopp ebenfalls bestätigen.")) {
+      return;
+    }
+    btn.disabled = true;
+    const msg = document.getElementById("action-msg");
+    msg.textContent = "Frage Abschaltung ab …";
+    try {
+      const key = localStorage.getItem(KEY_SLOT);
+      const headers = key ? { Authorization: "Bearer " + key } : {};
+      const r = await fetch("/stop", { method: "POST", headers });
+      let b = {};
+      try { b = await r.json(); } catch (e) { /* ignore */ }
+      msg.textContent = (b && b.message) || (r.ok ? "OK" : "Fehler (" + r.status + ")");
+      refreshShared();
+    } catch (e) {
+      msg.textContent = "Fehler: " + e;
+    }
+    btn.disabled = false;
+  });
+}
 """
 
 _PERSONAL_JS = """
@@ -531,6 +630,7 @@ $("days-select").addEventListener("change", (e) => {
   refresh();
 });
 initWake();
+initStop();
 refresh();
 setInterval(refresh, 15000);
 """
@@ -575,10 +675,11 @@ _PERSONAL_HTML = """<!doctype html>
       <div><span class="k">Idle</span><span id="st-idle">…</span></div>
     </div>
     <p class="muted" style="margin:.6rem 0 0">
-      <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span>
+      <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span><span id="st-stop"></span>
     </p>
     <p class="row" style="margin:.7rem 0 0">
       <button id="wake-btn" type="button">Server wecken</button>
+      <button id="stop-btn" type="button" class="danger">Server abschalten</button>
       <button id="idle-reset-btn" type="button" class="secondary">Abschaltung zurücksetzen</button>
       <span id="action-msg" class="muted"></span>
     </p>
@@ -752,6 +853,7 @@ $("days-select").addEventListener("change", (e) => {
   refresh();
 });
 initWake();
+initStop();
 refresh();
 setInterval(refresh, 15000);
 """
@@ -797,10 +899,11 @@ _ADMIN_HTML = """<!doctype html>
       <div><span class="k">Idle</span><span id="st-idle">…</span></div>
     </div>
     <p class="muted" style="margin:.6rem 0 0">
-      <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span>
+      <span id="st-boot">–</span> · Abschaltung in: <span id="st-shutdown">…</span><span id="st-pause"></span><span id="st-stop"></span>
     </p>
     <p class="row" style="margin:.7rem 0 0">
       <button id="wake-btn" type="button">Server wecken</button>
+      <button id="stop-btn" type="button" class="danger">Server abschalten</button>
       <button id="idle-reset-btn" type="button" class="secondary">Abschaltung zurücksetzen</button>
       <span id="action-msg" class="muted"></span>
     </p>

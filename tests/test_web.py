@@ -527,3 +527,82 @@ async def test_reset_idle_postpones_shutdown(app_env):
     # /status agrees: full countdown again
     body = await (await client.get("/status")).json()
     assert body["shutdown_in_s"] == pytest.approx(timeout, abs=2.0)
+
+
+# --- stop button (POST /stop) ----------------------------------------------
+
+
+async def test_stop_requires_identity(app_env):
+    app, client = app_env
+    _setup_keys(app)
+    resp = await client.post("/stop")  # no key, remote is loopback (tailnet-like)
+    assert resp.status == 401
+    body = await resp.json()
+    assert body["error"]["login_required"] is True
+    assert not app["power"].stop_pending
+
+
+async def test_stop_lan_fallback_waits_for_falko(app_env, lan_remote):
+    app, client = app_env
+    _setup_keys(app)
+    app["power"].note_user_activity("anton")
+    app["power"]._user_activity["falko"] = time.time()  # falko active within the window
+    resp = await client.post("/stop")  # no key, LAN -> identity "anton"
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["immediate"] is False
+    assert body["waiting_for"] == ["falko"]
+    assert "falko" in body["message"]
+    assert app["power"].stop_pending
+
+
+async def test_stop_all_consented_is_immediate(app_env, lan_remote):
+    app, client = app_env
+    _setup_keys(app)
+    app["power"].note_user_activity("anton")
+    resp = await client.post("/stop")
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["immediate"] is True
+    assert body["waiting_for"] == []
+    assert app["power"].stop_pending
+
+
+async def test_stop_with_master_key(app_env):
+    app, client = app_env
+    app["cfg"].proxy.master_api_key = "mkey"
+    app["keys"].create("falko")
+    app["power"].note_user_activity("master")
+    resp = await client.post("/stop", headers={"Authorization": "Bearer mkey"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["waiting_for"] == []
+    assert app["power"].stop_pending
+
+
+async def test_status_exposes_stop_fields(app_env, lan_remote):
+    app, client = app_env
+    _setup_keys(app)
+    body = await (await client.get("/status")).json()
+    assert body["stop_pending"] is False
+    assert body["stop_waiting_for"] == []
+    app["power"].note_user_activity("anton")
+    app["power"]._user_activity["falko"] = time.time()
+    await client.post("/stop")  # anton consents, falko does not
+    body = await (await client.get("/status")).json()
+    assert body["stop_pending"] is True
+    assert body["stop_waiting_for"] == ["falko"]
+
+
+async def test_stop_noop_when_server_off(app_env, lan_remote):
+    app, client = app_env
+    _setup_keys(app)
+    app["power"].state = ProxyState.OFF
+    resp = await client.post("/stop")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["immediate"] is False
+    assert not app["power"].stop_pending

@@ -254,6 +254,164 @@ async def test_idle_watchdog_stays_busy(tmp_path):
     assert pm.state is ProxyState.READY
 
 
+# --- stop intents (the "Server abschalten" button) -------------------------
+
+
+async def test_stop_consent_shuts_down_before_idle_timeout(tmp_path):
+    """Everyone active within the window consented -> early shutdown."""
+    fake = FakeLLM()
+    pm = make_pm(
+        tmp_path, fake,
+        proxy={"idle_timeout_s": 1200.0},  # the 20-min window, far from spent
+        llm={"base_url": "http://nonexistent.invalid:8080"},
+    )
+
+    async def power_off() -> None:
+        pass
+
+    pm.set_backends(power_off=power_off)
+    pm.mark_ready()
+    pm.note_user_activity("anton")
+    assert pm.idle_seconds < 10  # far below the 20-min window
+    pm.request_stop("anton")
+    assert pm.stop_pending
+    assert pm.stop_blocked_by(1200.0) == []
+    task = asyncio.create_task(pm.idle_watchdog(lambda: False, interval=0.05))
+    try:
+        for _ in range(200):
+            if pm.state is ProxyState.OFF:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+    assert pm.state is ProxyState.OFF
+
+
+async def test_stop_waits_for_unconsented_active_user(tmp_path):
+    """A user active within the window who did not consent blocks the
+    early shutdown; once they consent as well, the server goes off."""
+    fake = FakeLLM()
+    pm = make_pm(
+        tmp_path, fake,
+        proxy={"idle_timeout_s": 1200.0},
+        llm={"base_url": "http://nonexistent.invalid:8080"},
+    )
+
+    async def power_off() -> None:
+        pass
+
+    pm.set_backends(power_off=power_off)
+    pm.mark_ready()
+    pm.note_user_activity("anton")
+    pm._user_activity["falko"] = time.time() - 300  # falko active within the window
+    pm.request_stop("anton")
+    assert pm.stop_blocked_by(1200.0) == ["falko"]
+    task = asyncio.create_task(pm.idle_watchdog(lambda: False, interval=0.05))
+    try:
+        await asyncio.sleep(0.3)
+    finally:
+        task.cancel()
+    assert pm.state is ProxyState.READY  # falko has not consented yet
+    # falko uses the button as well -> the server goes off
+    pm.request_stop("falko")
+    assert pm.stop_blocked_by(1200.0) == []
+    task = asyncio.create_task(pm.idle_watchdog(lambda: False, interval=0.05))
+    try:
+        for _ in range(200):
+            if pm.state is ProxyState.OFF:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+    assert pm.state is ProxyState.OFF
+
+
+async def test_stop_blocked_while_busy(tmp_path):
+    """Consent is in, but jobs are running -> no shutdown until they finish."""
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake, proxy={"idle_timeout_s": 1200.0})
+    pm.mark_ready()
+    pm.note_user_activity("anton")
+    pm.request_stop("anton")
+    assert pm.stop_blocked_by(1200.0) == []
+    task = asyncio.create_task(pm.idle_watchdog(lambda: True, interval=0.05))  # always busy
+    try:
+        await asyncio.sleep(0.3)
+    finally:
+        task.cancel()
+    assert pm.state is ProxyState.READY
+
+
+def test_activity_cancels_stop_intent(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+    pm.mark_ready()
+    pm.request_stop("anton")
+    assert pm.stop_pending
+    pm.note_user_activity("anton")  # anton uses the server again
+    assert not pm.stop_pending
+    assert pm.stop_blocked_by(1200.0) == ["anton"]
+
+
+def test_user_outside_window_does_not_block(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+    pm.mark_ready()
+    pm._user_activity["anton"] = time.time()
+    pm._user_activity["falko"] = time.time() - 3600  # outside the 20-min window
+    pm.request_stop("anton")
+    assert pm.active_users_within(1200.0) == ["anton"]
+    assert pm.stop_blocked_by(1200.0) == []
+
+
+async def test_failed_shutdown_keeps_stop_intent(tmp_path):
+    """A failed poweroff keeps the intent so the watchdog retries."""
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+
+    async def boom() -> None:
+        raise RuntimeError("no ssh")
+
+    pm.set_backends(power_off=boom)
+    pm.mark_ready()
+    pm.request_stop("anton")
+    await pm.shutdown()
+    assert pm.state is ProxyState.READY
+    assert pm.stop_pending
+
+
+async def test_successful_shutdown_clears_stop_intents(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(
+        tmp_path, fake,
+        power={"shutdown_verify_timeout_s": 0.2},
+        llm={"base_url": "http://nonexistent.invalid:8080"},
+    )
+
+    async def power_off() -> None:
+        pass
+
+    pm.set_backends(power_off=power_off)
+    pm.mark_ready()
+    pm.request_stop("anton")
+    await pm.shutdown()
+    assert pm.state is ProxyState.OFF
+    assert not pm.stop_pending
+
+
+def test_reboot_and_degrade_clear_stop_intents(tmp_path):
+    fake = FakeLLM()
+    pm = make_pm(tmp_path, fake)
+    pm.request_stop("anton")
+    assert pm.stop_pending
+    pm.mark_ready()  # fresh boot: consents from before the off-period are stale
+    assert not pm.stop_pending
+    pm.request_stop("anton")
+    assert pm.stop_pending
+    pm.degrade()  # server died: consents are meaningless
+    assert not pm.stop_pending
+
+
 async def test_idle_gap_equal_split_two_users(tmp_path):
     fake = FakeLLM()
     pm = make_pm(tmp_path, fake)

@@ -124,7 +124,14 @@ async def usage_view(request: web.Request) -> web.Response:
         days = 7
     totals = request.app["usage"].totals(days=days)
     return web.json_response(
-        {"days": days, "users": totals, "daily": request.app["usage"].daily(days=days)}
+        {
+            "days": days,
+            "users": totals,
+            "daily": request.app["usage"].daily(days=days),
+            # today's server-on time split summed over ALL users
+            # (distribution bar on the admin page)
+            "today": request.app["usage"].today_phase_seconds(),
+        }
     )
 
 

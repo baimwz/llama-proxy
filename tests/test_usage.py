@@ -102,6 +102,27 @@ def test_phase_idle_energy_recorded(tmp_path):
     assert row["energy_wh"] == pytest.approx(expected_wh, rel=1e-6)
 
 
+def test_today_phase_seconds(tmp_path):
+    u = UsageTracker(str(tmp_path), 60)
+    u.record("anton", 100, 50, 1, prefill_seconds=0.5,
+             generation_seconds=1.5, idle_seconds=60)
+    u.record("falko", 10, 5, 1, prefill_seconds=0.25,
+             generation_seconds=0.75, idle_seconds=30)
+    # per user: only their own server-on time
+    assert u.today_phase_seconds("anton") == {
+        "prefill_seconds": 0.5, "generation_seconds": 1.5, "idle_seconds": 60.0,
+    }
+    # overall (admin bar): sum over all users
+    total = u.today_phase_seconds()
+    assert total["prefill_seconds"] == pytest.approx(0.75)
+    assert total["generation_seconds"] == pytest.approx(2.25)
+    assert total["idle_seconds"] == pytest.approx(90.0)
+    # user without activity today -> all zeros
+    assert u.today_phase_seconds("ghost") == {
+        "prefill_seconds": 0.0, "generation_seconds": 0.0, "idle_seconds": 0.0,
+    }
+
+
 def test_legacy_rows_without_phase_fields(tmp_path):
     # rows written before the phase/idle/energy fields existed must load
     # cleanly, aggregate as zeros, and accept new records (backfill)

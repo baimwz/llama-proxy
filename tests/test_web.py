@@ -126,12 +126,17 @@ async def test_pages_served(app_env):
         assert "login" in html.lower()
         # build-time placeholders must be replaced
         assert "__CSS__" not in html and "__STATUS_JS__" not in html
+        # distribution bar (today's server-on time) on both pages
+        for el in ("dist-card", "dist-track", "dist-prefill", "dist-generation",
+                   "dist-idle", "dist-legend"):
+            assert f'id="{el}"' in html
 
 
 async def test_usage_me_lan_fallback(app_env, lan_remote):
     app, client = app_env
     _setup_keys(app)
-    app["usage"].record("anton", 10, 5, 1, cached_tokens=2, compute_seconds=1.25)
+    app["usage"].record("anton", 10, 5, 1, cached_tokens=2, compute_seconds=1.25,
+                        prefill_seconds=0.25, generation_seconds=1.0, idle_seconds=120)
     resp = await client.get("/usage/me")  # no key, remote = LAN
     assert resp.status == 200
     body = await resp.json()
@@ -139,8 +144,29 @@ async def test_usage_me_lan_fallback(app_env, lan_remote):
     assert body["totals"]["prompt"] == 10
     assert body["totals"]["compute_seconds"] == 1.25
     assert body["daily"][0]["prompt"] == 10
+    # distribution bar: today's server-on time for this user only
+    assert body["today"] == {
+        "prefill_seconds": 0.25, "generation_seconds": 1.0, "idle_seconds": 120.0,
+    }
     # isolation: no other user may leak
     assert "falko" not in json.dumps(body)
+
+
+async def test_admin_usage_today_bar_sums_all_users(app_env):
+    # the admin distribution bar gets today's server-on time summed over
+    # ALL users (Anton: "Ja, nur gesamt")
+    app, client = app_env
+    _setup_keys(app)
+    app["usage"].record("falko", 10, 5, 1, prefill_seconds=0.5,
+                        generation_seconds=1.0, idle_seconds=60)
+    app["usage"].record("leo", 2, 1, 1, prefill_seconds=0.1,
+                        generation_seconds=0.2, idle_seconds=30)
+    resp = await client.get("/admin/usage", headers={"Authorization": "Bearer mkey"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["today"]["prefill_seconds"] == pytest.approx(0.6)
+    assert body["today"]["generation_seconds"] == pytest.approx(1.2)
+    assert body["today"]["idle_seconds"] == pytest.approx(90.0)
 
 
 async def test_usage_me_tailnet_requires_key(app_env):

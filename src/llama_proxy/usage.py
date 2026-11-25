@@ -171,6 +171,27 @@ class UsageTracker:
             out[u] = rows
         return out
 
+    def today_phase_seconds(self, user: str | None = None) -> dict:
+        """Today's server-on time split into prefill / generation / idle.
+
+        The sum of the three is exactly the time the server was on today
+        (server-off time is never accounted), which is what the
+        distribution bar displays. ``user=None`` sums over all users
+        (admin view).
+        """
+        day = date.today().isoformat()
+        out = {"prefill_seconds": 0.0, "generation_seconds": 0.0, "idle_seconds": 0.0}
+        users = [user] if user is not None else list(self._data.keys())
+        for u in users:
+            row = self._data.get(u, {}).get(day)
+            if not row:
+                continue
+            for k in out:
+                out[k] += float(row.get(k, 0) or 0)
+        for k in out:
+            out[k] = round(out[k], 2)
+        return out
+
     @staticmethod
     def _in_window(day: str, cutoff: float) -> bool:
         try:

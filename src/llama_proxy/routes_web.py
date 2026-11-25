@@ -107,6 +107,9 @@ async def usage_me(request: web.Request) -> web.Response:
             "days": days,
             "totals": totals.get(ident.name) or _zero_totals(),
             "daily": daily,
+            # today's server-on time split (idle/prefill/generation) for
+            # the distribution bar; server-off time is not included
+            "today": app["usage"].today_phase_seconds(ident.name),
         }
     )
 
@@ -285,6 +288,16 @@ summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 .ld-track { height: 10px; background: #eef1f5; border-radius: 6px; overflow: hidden; }
 .ld-bar { height: 100%; background: var(--accent); }
 .ld-label { font-size: .82rem; color: var(--muted); margin-top: .15rem; }
+.dist-track { display: flex; height: 14px; border-radius: 7px; overflow: hidden;
+              background: #eef1f5; }
+.dist-seg { height: 100%; min-width: 0; }
+.dist-seg.prefill { background: var(--accent); }
+.dist-seg.generation { background: #2e9e5b; }
+.dist-seg.idle { background: #b9c2cf; }
+.dist-legend { display: flex; gap: 1.1rem; flex-wrap: wrap; margin-top: .45rem;
+               font-size: .82rem; }
+.dist-dot { display: inline-block; width: .6em; height: .6em; border-radius: 2px;
+            margin-right: .35em; }
 """
 
 _STATUS_JS = """
@@ -377,6 +390,35 @@ function renderLoad(d) {
     el.appendChild(user);
   }
 }
+// Distribution bar: today's server-on time split into Prefill / Generation
+// / Idle. Widths are shares of (prefill + generation + idle), so time with
+// the server powered OFF never shows up (Anton: "Aus-Zeiten nicht zeigen").
+function renderDist(t) {
+  const track = document.getElementById("dist-track");
+  const legend = document.getElementById("dist-legend");
+  if (!track || !legend) return;
+  const p = Number((t || {}).prefill_seconds || 0);
+  const g = Number((t || {}).generation_seconds || 0);
+  const i = Number((t || {}).idle_seconds || 0);
+  const total = p + g + i;
+  if (total <= 0) {
+    track.style.visibility = "hidden";
+    legend.innerHTML = '<span>Heute noch keine Serverzeit.</span>';
+    return;
+  }
+  track.style.visibility = "visible";
+  document.getElementById("dist-prefill").style.width = (p / total * 100) + "%";
+  document.getElementById("dist-generation").style.width = (g / total * 100) + "%";
+  document.getElementById("dist-idle").style.width = (i / total * 100) + "%";
+  const pct = (v) => (v / total * 100).toLocaleString("de-DE", {maximumFractionDigits: 1}) + " %";
+  const item = (color, name, v) =>
+    '<span><span class="dist-dot" style="background:' + color + '"></span>' +
+    name + " " + fmtSecs(v) + " (" + pct(v) + ")</span>";
+  legend.innerHTML =
+    item("var(--accent)", "Prefill", p) +
+    item("#2e9e5b", "Generation", g) +
+    item("#b9c2cf", "Idle", i);
+}
 async function refreshShared() {
   const [rs, rl] = await Promise.all([
     api("/status"),
@@ -418,19 +460,19 @@ const $ = (id) => document.getElementById(id);
 function usageCells(r) {
   return "<td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
     fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
-    fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td><td>" +
-    fmtSecs(r.prefill_seconds) + "</td><td>" + fmtSecs(r.generation_seconds) +
-    "</td><td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
+    fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td>" +
+    "<td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
 }
 function renderUsage(d) {
   $("user-badge").textContent = d.user;
   const t = d.totals || {};
   const rows = d.daily || [];
+  renderDist(d.today);
   const tbody = $("usage-tbody");
   tbody.innerHTML = "";
   if (!rows.length) {
     tbody.innerHTML =
-      '<tr><td colspan="10" class="muted">Noch keine Nutzung in dem Zeitraum.</td></tr>';
+      '<tr><td colspan="8" class="muted">Noch keine Nutzung in dem Zeitraum.</td></tr>';
   }
   for (const r of rows.slice().reverse()) {
     const tr = document.createElement("tr");
@@ -439,7 +481,7 @@ function renderUsage(d) {
   }
   const tsum = {day: "Summe (" + days + " Tage)"};
   for (const k of ["prompt","completion","cached","requests","compute_seconds",
-                   "prefill_seconds","generation_seconds","idle_seconds","energy_wh"]) {
+                   "idle_seconds","energy_wh"]) {
     tsum[k] = t[k] || 0;
   }
   $("usage-tfoot").innerHTML = "<tr>" + usageCells(tsum) + "</tr>";
@@ -448,6 +490,7 @@ function renderUsage(d) {
 function setLoginVisible(v) {
   $("login-card").hidden = !v;
   $("usage-card").hidden = v;
+  $("dist-card").hidden = v;
 }
 
 async function refresh() {
@@ -503,6 +546,23 @@ _PERSONAL_HTML = """<!doctype html>
   <span id="user-badge" class="badge user"></span>
 </header>
 <main>
+  <section class="card" id="dist-card" hidden>
+    <h2>Heute
+      <span class="muted" style="font-size:.8rem;font-weight:400">· meine Server-an-Zeit</span>
+    </h2>
+    <div class="dist-track" id="dist-track">
+      <div class="dist-seg prefill" id="dist-prefill"></div>
+      <div class="dist-seg generation" id="dist-generation"></div>
+      <div class="dist-seg idle" id="dist-idle"></div>
+    </div>
+    <div class="dist-legend muted" id="dist-legend"></div>
+    <p class="muted" style="margin:.6rem 0 0">
+      Verteilung meiner Server-an-Zeit heute: Prefill (Prompt-Verarbeitung),
+      Generation (Antwort), Idle (Server an, nicht rechnend). Zeiträume,
+      in denen der Server ausgeschaltet war, sind nicht enthalten.
+    </p>
+  </section>
+
   <section class="card">
     <h2>Live-Status</h2>
     <div class="row">
@@ -547,14 +607,14 @@ _PERSONAL_HTML = """<!doctype html>
     <table>
       <thead>
         <tr><th>Datum</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
-        <th>Rechenzeit</th><th>Prefill</th><th>Generation</th><th>Idle</th><th>Strom</th></tr>
+        <th>Rechenzeit</th><th>Idle</th><th>Strom</th></tr>
       </thead>
       <tbody id="usage-tbody"></tbody>
       <tfoot id="usage-tfoot"></tfoot>
     </table>
     <p class="muted" style="margin:.6rem 0 0">
-      Rechenzeit = GPU-Berechnungszeit des LLM (llama.cpp timings), pro Tag.
-      Prefill = Prompt-Verarbeitung, Generation = Antwort-Generierung.
+      Rechenzeit = GPU-Berechnungszeit des LLM (llama.cpp timings,
+      Prefill + Generation), pro Tag.
       Idle = Zeit, in der der Server für dich an war, aber nicht rechnete
       (bei mehreren aktiven Nutzern anteilig aufgeteilt).
       Strom = Näherung aus den konfigurierten Durchschnittsverbräuchen
@@ -591,8 +651,7 @@ let days = 30;
 const $ = (id) => document.getElementById(id);
 
 const USAGE_COLS = '<th>Datum</th><th>Prompt</th><th>Completion</th><th>Cached</th>' +
-  '<th>Anfragen</th><th>Rechenzeit</th><th>Prefill</th><th>Generation</th>' +
-  '<th>Idle</th><th>Strom</th>';
+  '<th>Anfragen</th><th>Rechenzeit</th><th>Idle</th><th>Strom</th>';
 function dailyTable(rows) {
   if (!rows.length) return '<p class="muted">keine Daten in dem Zeitraum</p>';
   let html = '<table><thead><tr>' + USAGE_COLS + '</tr></thead><tbody>';
@@ -604,24 +663,23 @@ function dailyTable(rows) {
 function usageCells(r) {
   return "<td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
     fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
-    fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td><td>" +
-    fmtSecs(r.prefill_seconds) + "</td><td>" + fmtSecs(r.generation_seconds) +
-    "</td><td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
+    fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td>" +
+    "<td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
 }
 
 function renderAdmin(data, keys) {
   const users = Object.keys(data.users || {}).sort();
+  renderDist(data.today);
   let html = "";
   for (const name of users) {
     const t = data.users[name];
     html += "<tr><td>" + name + "</td><td>" + fmtInt(t.prompt) + "</td><td>" +
       fmtInt(t.completion) + "</td><td>" + fmtInt(t.cached) + "</td><td>" +
-      fmtInt(t.requests) + "</td><td>" + fmtSecs(t.compute_seconds) + "</td><td>" +
-      fmtSecs(t.prefill_seconds) + "</td><td>" + fmtSecs(t.generation_seconds) +
-      "</td><td>" + fmtSecs(t.idle_seconds) + "</td><td>" + fmtWh(t.energy_wh) + "</td></tr>";
+      fmtInt(t.requests) + "</td><td>" + fmtSecs(t.compute_seconds) + "</td>" +
+      "<td>" + fmtSecs(t.idle_seconds) + "</td><td>" + fmtWh(t.energy_wh) + "</td></tr>";
   }
   $("users-tbody").innerHTML =
-    html || '<tr><td colspan="10" class="muted">Noch keine Nutzungsdaten.</td></tr>';
+    html || '<tr><td colspan="8" class="muted">Noch keine Nutzungsdaten.</td></tr>';
 
   let dh = "";
   for (const name of users) {
@@ -646,6 +704,7 @@ function renderAdmin(data, keys) {
 function setLoginVisible(v) {
   $("login-card").hidden = !v;
   $("data-cards").hidden = v;
+  $("dist-card").hidden = v;
 }
 
 async function refresh() {
@@ -702,6 +761,24 @@ _ADMIN_HTML = """<!doctype html>
   <a href="/" class="badge user">zurück</a>
 </header>
 <main>
+  <section class="card" id="dist-card" hidden>
+    <h2>Heute
+      <span class="muted" style="font-size:.8rem;font-weight:400">· Server-an-Zeit (alle Nutzer)</span>
+    </h2>
+    <div class="dist-track" id="dist-track">
+      <div class="dist-seg prefill" id="dist-prefill"></div>
+      <div class="dist-seg generation" id="dist-generation"></div>
+      <div class="dist-seg idle" id="dist-idle"></div>
+    </div>
+    <div class="dist-legend muted" id="dist-legend"></div>
+    <p class="muted" style="margin:.6rem 0 0">
+      Verteilung der Server-an-Zeit heute (alle Nutzer): Prefill
+      (Prompt-Verarbeitung), Generation (Antwort), Idle (Server an, nicht
+      rechnend). Zeiträume, in denen der Server ausgeschaltet war, sind
+      nicht enthalten.
+    </p>
+  </section>
+
   <section class="card">
     <h2>Live-Status</h2>
     <div class="row">
@@ -747,12 +824,12 @@ _ADMIN_HTML = """<!doctype html>
       <table>
         <thead>
           <tr><th>User</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
-          <th>Rechenzeit</th><th>Prefill</th><th>Generation</th><th>Idle</th><th>Strom</th></tr>
+          <th>Rechenzeit</th><th>Idle</th><th>Strom</th></tr>
         </thead>
         <tbody id="users-tbody"></tbody>
       </table>
       <p class="muted" style="margin:.6rem 0 0">
-        Prefill = Prompt-Verarbeitung, Generation = Antwort-Generierung.
+        Rechenzeit = GPU-Berechnungszeit des LLM (Prefill + Generation).
         Idle = Server an, aber nicht rechnend; anteilig auf kürzlich aktive
         Nutzer aufgeteilt. Strom = Näherung aus konfigurierten
         Durchschnittsverbräuchen (idle / prefill / generation in W) –

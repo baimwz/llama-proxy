@@ -12,14 +12,13 @@ is fetched client-side from the JSON endpoints in this module.
 """
 from __future__ import annotations
 
-from datetime import datetime
-
 from aiohttp import web
 
 from .auth import Auth, Identity, token_from_header
 from .config import Config
 from .power import ProxyState
 from .routes_openai import err
+from .timeutil import now_local
 
 _KEY_HEADER = "Authorization"
 
@@ -147,7 +146,8 @@ async def status_view(request: web.Request) -> web.Response:
                 "active_large": sum(1 for j in active if j.is_large),
                 "queued": app["queue"].pending_count(),
             },
-            "server_time": datetime.now().isoformat(timespec="seconds"),
+            # local (Europe/Berlin) time, DST-aware
+            "server_time": now_local().isoformat(timespec="seconds"),
         }
     )
 
@@ -457,8 +457,11 @@ const KEY_SLOT = "llama_proxy_key";
 let days = 30;
 const $ = (id) => document.getElementById(id);
 
+// "Prompt (neu)": fresh prompt tokens only — cached tokens are shown in
+// their own column and not counted twice here (Anton: "nur frische sehen")
+function freshPrompt(r) { return Math.max(0, (r.prompt || 0) - (r.cached || 0)); }
 function usageCells(r) {
-  return "<td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
+  return "<td>" + r.day + "</td><td>" + fmtInt(freshPrompt(r)) + "</td><td>" +
     fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
     fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td>" +
     "<td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
@@ -589,7 +592,8 @@ _PERSONAL_HTML = """<!doctype html>
     </div>
     <div id="ld-users" style="margin-top:.5rem"></div>
     <p class="muted" style="margin:.6rem 0 0">
-      Anteil an der GPU-Berechnungszeit im Zeitraum (Live-Wert, kein Verlauf).
+      GPU-Auslastung im Zeitraum: Busy-Sekunden des Nutzers ÷ Fenster
+      (max. 100 %) — Live-Wert, kein Verlauf.
     </p>
   </section>
 
@@ -606,7 +610,7 @@ _PERSONAL_HTML = """<!doctype html>
     </h2>
     <table>
       <thead>
-        <tr><th>Datum</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
+        <tr><th>Datum</th><th>Prompt (neu)</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
         <th>Rechenzeit</th><th>Idle</th><th>Strom</th></tr>
       </thead>
       <tbody id="usage-tbody"></tbody>
@@ -615,6 +619,8 @@ _PERSONAL_HTML = """<!doctype html>
     <p class="muted" style="margin:.6rem 0 0">
       Rechenzeit = GPU-Berechnungszeit des LLM (llama.cpp timings,
       Prefill + Generation), pro Tag.
+      Prompt (neu) = frische Prompt-Tokens (Cache-Treffer abgezogen);
+      Cached = Prompt-Tokens, die der Server aus dem KV-Cache bedient hat.
       Idle = Zeit, in der der Server für dich an war, aber nicht rechnete
       (bei mehreren aktiven Nutzern anteilig aufgeteilt).
       Strom = Näherung aus den konfigurierten Durchschnittsverbräuchen
@@ -650,7 +656,7 @@ const KEY_SLOT = "llama_proxy_master_key";
 let days = 30;
 const $ = (id) => document.getElementById(id);
 
-const USAGE_COLS = '<th>Datum</th><th>Prompt</th><th>Completion</th><th>Cached</th>' +
+const USAGE_COLS = '<th>Datum</th><th>Prompt (neu)</th><th>Completion</th><th>Cached</th>' +
   '<th>Anfragen</th><th>Rechenzeit</th><th>Idle</th><th>Strom</th>';
 function dailyTable(rows) {
   if (!rows.length) return '<p class="muted">keine Daten in dem Zeitraum</p>';
@@ -660,8 +666,11 @@ function dailyTable(rows) {
   }
   return html + "</tbody></table>";
 }
+// "Prompt (neu)": fresh prompt tokens only — cached tokens are shown in
+// their own column and not counted twice here (Anton: "nur frische sehen")
+function freshPrompt(r) { return Math.max(0, (r.prompt || 0) - (r.cached || 0)); }
 function usageCells(r) {
-  return "<td>" + r.day + "</td><td>" + fmtInt(r.prompt) + "</td><td>" +
+  return "<td>" + r.day + "</td><td>" + fmtInt(freshPrompt(r)) + "</td><td>" +
     fmtInt(r.completion) + "</td><td>" + fmtInt(r.cached) + "</td><td>" +
     fmtInt(r.requests) + "</td><td>" + fmtSecs(r.compute_seconds) + "</td>" +
     "<td>" + fmtSecs(r.idle_seconds) + "</td><td>" + fmtWh(r.energy_wh) + "</td>";
@@ -673,7 +682,7 @@ function renderAdmin(data, keys) {
   let html = "";
   for (const name of users) {
     const t = data.users[name];
-    html += "<tr><td>" + name + "</td><td>" + fmtInt(t.prompt) + "</td><td>" +
+    html += "<tr><td>" + name + "</td><td>" + fmtInt(freshPrompt(t)) + "</td><td>" +
       fmtInt(t.completion) + "</td><td>" + fmtInt(t.cached) + "</td><td>" +
       fmtInt(t.requests) + "</td><td>" + fmtSecs(t.compute_seconds) + "</td>" +
       "<td>" + fmtSecs(t.idle_seconds) + "</td><td>" + fmtWh(t.energy_wh) + "</td></tr>";
@@ -763,7 +772,7 @@ _ADMIN_HTML = """<!doctype html>
 <main>
   <section class="card" id="dist-card" hidden>
     <h2>Heute
-      <span class="muted" style="font-size:.8rem;font-weight:400">· Server-an-Zeit (alle Nutzer)</span>
+      <span class="muted" style="font-size:.8rem;font-weight:400">· alle Nutzer</span>
     </h2>
     <div class="dist-track" id="dist-track">
       <div class="dist-seg prefill" id="dist-prefill"></div>
@@ -805,7 +814,8 @@ _ADMIN_HTML = """<!doctype html>
     </div>
     <div id="ld-users" style="margin-top:.5rem"></div>
     <p class="muted" style="margin:.6rem 0 0">
-      Anteil an der GPU-Berechnungszeit im Zeitraum (Live-Wert, kein Verlauf).
+      GPU-Auslastung im Zeitraum: Busy-Sekunden des Nutzers ÷ Fenster
+      (max. 100 %) — Live-Wert, kein Verlauf.
     </p>
   </section>
 
@@ -823,13 +833,15 @@ _ADMIN_HTML = """<!doctype html>
       </h2>
       <table>
         <thead>
-          <tr><th>User</th><th>Prompt</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
+          <tr><th>User</th><th>Prompt (neu)</th><th>Completion</th><th>Cached</th><th>Anfragen</th>
           <th>Rechenzeit</th><th>Idle</th><th>Strom</th></tr>
         </thead>
         <tbody id="users-tbody"></tbody>
       </table>
       <p class="muted" style="margin:.6rem 0 0">
         Rechenzeit = GPU-Berechnungszeit des LLM (Prefill + Generation).
+        Prompt (neu) = frische Prompt-Tokens (Cache-Treffer abgezogen);
+        Cached = Prompt-Tokens, die der Server aus dem KV-Cache bedient hat.
         Idle = Server an, aber nicht rechnend; anteilig auf kürzlich aktive
         Nutzer aufgeteilt. Strom = Näherung aus konfigurierten
         Durchschnittsverbräuchen (idle / prefill / generation in W) –

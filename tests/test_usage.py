@@ -1,7 +1,8 @@
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 
+from llama_proxy.timeutil import today_local
 from llama_proxy.usage import UsageTracker
 
 
@@ -19,7 +20,7 @@ def test_record_flush_reload(tmp_path):
 
 def test_totals_window(tmp_path):
     u = UsageTracker(str(tmp_path), 60)
-    old_day = (date.today() - timedelta(days=90)).isoformat()
+    old_day = (today_local() - timedelta(days=90)).isoformat()
     u._data["u1"] = {old_day: {"prompt": 5, "completion": 1, "requests": 1}}
     totals = u.totals(days=30)
     assert totals["u1"]["prompt"] == 0
@@ -48,10 +49,8 @@ def test_cached_tokens_default_zero(tmp_path):
 
 def test_legacy_rows_without_cached_field(tmp_path):
     # rows written before the `cached` field existed must not break totals()
-    from datetime import date
-
     u = UsageTracker(str(tmp_path), 60)
-    u._data["u1"] = {date.today().isoformat(): {"prompt": 5, "completion": 1, "requests": 1}}
+    u._data["u1"] = {today_local().isoformat(): {"prompt": 5, "completion": 1, "requests": 1}}
     totals = u.totals(days=30)
     assert totals["u1"]["prompt"] == 5
     assert totals["u1"]["cached"] == 0
@@ -63,7 +62,7 @@ def test_record_on_legacy_row_backfills_cached(tmp_path):
     # request after the client already received its response. It must now
     # backfill the field and record every counter.
     u = UsageTracker(str(tmp_path), 60)
-    day = date.today().isoformat()
+    day = today_local().isoformat()
     u._data["u1"] = {day: {"prompt": 5, "completion": 1, "requests": 1}}
     u.record("u1", 10, 4, 1, cached_tokens=6)  # must not raise
     row = u._data["u1"][day]
@@ -102,6 +101,23 @@ def test_phase_idle_energy_recorded(tmp_path):
     assert row["energy_wh"] == pytest.approx(expected_wh, rel=1e-6)
 
 
+def test_day_boundaries_are_local(tmp_path):
+    # the LXC runs UTC; day keys and "today" must follow Europe/Berlin
+    # (DST-aware), otherwise late-evening jobs land on the wrong day
+    u = UsageTracker(str(tmp_path), 60)
+    u.record("anton", 10, 5, 1)
+    assert list(u._data["anton"].keys()) == [today_local().isoformat()]
+    assert u.today_total("anton") == 15
+    # window cutoffs are local dates, too
+    two_days_ago = (today_local() - timedelta(days=2)).isoformat()
+    u._data["u2"] = {two_days_ago: {"prompt": 3, "completion": 1, "requests": 1}}
+    assert u.totals(days=1)["u2"]["prompt"] == 0  # 2 days ago is outside days=1
+    assert u.totals(days=2)["u2"]["prompt"] == 3  # ...but inside days=2
+    # garbage day keys are ignored, not a crash
+    u._data["u3"] = {"not-a-date": {"prompt": 9}}
+    assert u.totals(days=30)["u3"]["prompt"] == 0
+
+
 def test_today_phase_seconds(tmp_path):
     u = UsageTracker(str(tmp_path), 60)
     u.record("anton", 100, 50, 1, prefill_seconds=0.5,
@@ -126,7 +142,7 @@ def test_today_phase_seconds(tmp_path):
 def test_legacy_rows_without_phase_fields(tmp_path):
     # rows written before the phase/idle/energy fields existed must load
     # cleanly, aggregate as zeros, and accept new records (backfill)
-    day = date.today().isoformat()
+    day = today_local().isoformat()
     u = UsageTracker(str(tmp_path), 60)
     u._data["u1"] = {day: {"prompt": 5, "completion": 1, "requests": 1,
                            "compute_seconds": 1.0}}
@@ -143,7 +159,7 @@ def test_legacy_rows_without_phase_fields(tmp_path):
 def test_reload_backfills_legacy_rows(tmp_path):
     # A usage.json written by an older version (no "cached" key) must load
     # cleanly and record() on its rows must work.
-    day = date.today().isoformat()
+    day = today_local().isoformat()
     (tmp_path / "usage.json").write_text(
         '{"master": {"%s": {"prompt": 4471, "completion": 698, "requests": 9}}}' % day
     )

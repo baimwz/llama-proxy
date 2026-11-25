@@ -126,6 +126,9 @@ async def test_pages_served(app_env):
         assert "login" in html.lower()
         # build-time placeholders must be replaced
         assert "__CSS__" not in html and "__STATUS_JS__" not in html
+        # prompt column shows FRESH tokens (prompt - cached), cached separate
+        assert "Prompt (neu)" in html
+        assert "freshPrompt" in html
         # distribution bar (today's server-on time) on both pages
         for el in ("dist-card", "dist-track", "dist-prefill", "dist-generation",
                    "dist-idle", "dist-legend"):
@@ -331,9 +334,11 @@ def test_load_snapshot_aggregation():
     assert s["jobs"] == 3
     assert s["utilization_pct"] == pytest.approx(5.0)  # 60 s / 1200 s
     assert [u["name"] for u in s["users"]] == ["anton", "falko"]
-    assert s["users"][0]["pct"] == pytest.approx(66.7)
+    # per-user pct = GPU utilization within the window (busy / window),
+    # NOT the share of total busy time (a single user would always be 100%)
+    assert s["users"][0]["pct"] == pytest.approx(3.3)  # 40 s / 1200 s
     assert s["users"][0]["jobs"] == 2
-    assert s["users"][1]["pct"] == pytest.approx(33.3)
+    assert s["users"][1]["pct"] == pytest.approx(1.7)  # 20 s / 1200 s
 
 
 def test_load_snapshot_empty_and_window_filter():
@@ -349,7 +354,11 @@ def test_load_snapshot_utilization_capped():
     rl = RecentLoad()
     now = 3_000_000.0
     rl.record("anton", 2000.0, now=now)  # busy > window => cap at 100 %
-    assert rl.snapshot(1200, now=now)["utilization_pct"] == 100.0
+    s = rl.snapshot(1200, now=now)
+    assert s["utilization_pct"] == 100.0
+    # per-user pct is capped at 100 % as well (a single user is not "100%
+    # of the busy time" but "their share of the window")
+    assert s["users"][0]["pct"] == 100.0
 
 
 async def test_usage_recent_endpoint(app_env):
@@ -363,7 +372,9 @@ async def test_usage_recent_endpoint(app_env):
     assert body["busy_seconds"] == pytest.approx(30.0)
     assert body["jobs"] == 1
     assert body["users"][0]["name"] == "falko"
-    assert body["users"][0]["pct"] == pytest.approx(100.0)
+    # pct = GPU utilization within the window (30 s / 1200 s), not 100 %
+    # just because falko is the only user
+    assert body["users"][0]["pct"] == pytest.approx(2.5)
 
 
 async def test_load_recorded_on_finished_job(app_env):

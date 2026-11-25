@@ -6,13 +6,14 @@ mode) and checks the per-user rate limits before a job is enqueued.
 from __future__ import annotations
 
 import secrets
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
 from aiohttp import web
 
 from .keys import KeyStore, UserKey
 from .ratelimit import RateLimiter
+from .timeutil import local_midnight_ts
 from .usage import UsageTracker
 
 
@@ -67,7 +68,7 @@ class Auth:
         if key.tokens_per_day > 0:
             used = self._usage.today_total(ident.name)
             if used + est_tokens > key.tokens_per_day:
-                now = datetime.now()
-                midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-                return True, max(1, int((midnight - now).total_seconds()))
+                # limits reset at the next LOCAL (Europe/Berlin) midnight
+                retry = int(local_midnight_ts(1) - time.time())
+                return True, max(1, retry)
         return False, 0

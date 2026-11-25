@@ -15,8 +15,9 @@ import os
 import re
 import secrets
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
+
+from .timeutil import now_local, today_local
 
 log = logging.getLogger("llama_proxy.keys")
 
@@ -97,7 +98,7 @@ class KeyStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "salt": self._salt.hex(),
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": now_local().isoformat(timespec="seconds"),
             "users": {h: asdict(u) for h, u in self._by_hash.items()},
         }
         tmp = self._path.with_suffix(".json.tmp")
@@ -185,7 +186,7 @@ class KeyStore:
                 0,
                 int(self._defaults["tokens_per_day"] if tokens_per_day is None else tokens_per_day),
             ),
-            created_at=datetime.now().strftime("%Y-%m-%d"),
+            created_at=today_local().isoformat(),
         )
         record.priority = min(record.priority, record.max_priority)
         self._by_hash[self.hash_key(key)] = record

@@ -10,8 +10,10 @@ import json
 import logging
 import os
 import time
-from datetime import date, datetime
+from datetime import date, timedelta
 from pathlib import Path
+
+from .timeutil import today_local
 
 log = logging.getLogger("llama_proxy.usage")
 
@@ -79,7 +81,9 @@ class UsageTracker:
         tokens + phase seconds + its share of the energy, while an idle-gap
         settlement records only ``idle_seconds``/``energy_wh`` (requests=0).
         """
-        day = date.today().isoformat()
+        # day boundary = LOCAL date (Europe/Berlin, DST-aware), not the
+        # LXC's UTC date — late-evening jobs must land on the right day
+        day = today_local().isoformat()
         per_user = self._data.setdefault(user, {})
         row = per_user.setdefault(day, {k: 0 for k in _ROW_FIELDS})
         _ensure_row_fields(row)
@@ -110,8 +114,11 @@ class UsageTracker:
             await asyncio.to_thread(self.flush)
 
     def totals(self, days: int = 30) -> dict:
-        """Aggregated totals for the last N days (for the web page / CLI)."""
-        cutoff = datetime.combine(date.today(), datetime.min.time()).timestamp() - days * 86400
+        """Aggregated totals for the last N days (for the web page / CLI).
+
+        Day boundaries follow the local timezone (Europe/Berlin).
+        """
+        cutoff = (today_local() - timedelta(days=days)).isoformat()
         out: dict[str, dict] = {}
         for user, per_day in self._data.items():
             agg = {
@@ -151,7 +158,7 @@ class UsageTracker:
         ``user`` selects one user; ``None`` returns every user. Each row has
         the date plus the counters (compute_seconds rounded to 2 decimals).
         """
-        cutoff = datetime.combine(date.today(), datetime.min.time()).timestamp() - days * 86400
+        cutoff = (today_local() - timedelta(days=days)).isoformat()
         users = [user] if user is not None else list(self._data.keys())
         out: dict[str, list[dict]] = {}
         for u in users:
@@ -179,7 +186,7 @@ class UsageTracker:
         distribution bar displays. ``user=None`` sums over all users
         (admin view).
         """
-        day = date.today().isoformat()
+        day = today_local().isoformat()
         out = {"prefill_seconds": 0.0, "generation_seconds": 0.0, "idle_seconds": 0.0}
         users = [user] if user is not None else list(self._data.keys())
         for u in users:
@@ -193,11 +200,14 @@ class UsageTracker:
         return out
 
     @staticmethod
-    def _in_window(day: str, cutoff: float) -> bool:
+    def _in_window(day: str, cutoff_day: str) -> bool:
+        """Rows are ISO dates (YYYY-MM-DD), which compare chronologically
+        as plain strings — no timezone math on the comparison itself."""
         try:
-            return datetime.fromisoformat(day).timestamp() >= cutoff
+            date.fromisoformat(day)
         except ValueError:
             return False
+        return day >= cutoff_day
 
     @property
     def last_flush(self) -> float:
@@ -205,7 +215,7 @@ class UsageTracker:
 
     def today_total(self, user: str) -> int:
         """Prompt + completion tokens recorded for `user` today."""
-        row = self._data.get(user, {}).get(date.today().isoformat())
+        row = self._data.get(user, {}).get(today_local().isoformat())
         if row is None:
             return 0
         return int(row.get("prompt", 0)) + int(row.get("completion", 0))

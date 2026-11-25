@@ -45,8 +45,11 @@ class RecentLoad:
 
         ``busy_seconds`` is the sum of GPU compute time in the window;
         ``utilization_pct`` is that as a share of the window wall-clock
-        (capped at 100); ``users`` lists every user's share of the busy
-        time (pct), sorted by busy_seconds descending.
+        (capped at 100); ``users`` lists every user's busy time, where
+        ``pct`` is the user's GPU utilization within the window
+        (busy_seconds ÷ window, capped at 100 — a single busy user is
+        not "100% of the busy time" but "their share of the window"),
+        sorted by busy_seconds descending.
         """
         now = time.time() if now is None else now
         self._prune(now)
@@ -67,7 +70,9 @@ class RecentLoad:
                 {
                     "name": name,
                     "busy_seconds": round(u["busy_seconds"], 3),
-                    "pct": round(100.0 * u["busy_seconds"] / busy, 1) if busy else 0.0,
+                    "pct": round(min(100.0, 100.0 * u["busy_seconds"] / window_s), 1)
+                    if window_s > 0
+                    else 0.0,
                     "jobs": u["jobs"],
                 }
                 for name, u in per_user.items()

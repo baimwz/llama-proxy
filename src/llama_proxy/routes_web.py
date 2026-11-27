@@ -321,6 +321,7 @@ main { max-width: 880px; margin: 0 auto; padding: 1rem 1rem 2rem; }
 .badge { display: inline-block; padding: .15rem .6rem; border-radius: 999px;
          font-size: .8rem; font-weight: 600; }
 .badge.ok { background: #e5f6ec; color: var(--ok); }
+.badge.warn { background: #fdf3d8; color: var(--warn); }
 .badge.bad { background: #fdeceb; color: var(--bad); }
 .badge.user { background: #e8eefc; color: var(--accent); }
 table { border-collapse: collapse; width: 100%; font-size: .9rem; }
@@ -348,6 +349,13 @@ footer { max-width: 880px; margin: 0 auto; padding: 0 1rem 2rem;
 details { margin: .3rem 0; }
 summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 .dwrap { margin: .5rem 0 .5rem 1rem; }
+.lg-chart { display: flex; align-items: stretch; gap: .3rem; }
+.lg-ytitle { writing-mode: vertical-rl; transform: rotate(180deg);
+             font-size: .7rem; color: var(--muted); align-self: center; }
+.lg-yaxis { display: flex; flex-direction: column; justify-content: space-between;
+            align-items: flex-end; font-size: .7rem; color: var(--muted);
+            height: 120px; padding: 3px 0; }
+.lg-plot { flex: 1 1 auto; min-width: 0; }
 .lg-track { display: flex; align-items: flex-end; gap: 1px; height: 120px;
             border: 1px solid var(--line); border-radius: 6px; padding: 2px; }
 .lg-cell { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; }
@@ -412,8 +420,30 @@ function paintStatus() {
     ? timeout_s
     : Math.max(0, (d.shutdown_in_s == null ? timeout_s : d.shutdown_in_s) - elapsed_s);
   const el = document.getElementById("st-state");
-  el.textContent = d.up ? "läuft" : d.server_state;
-  el.className = "badge " + (d.up ? "ok" : "bad");
+  // Badge = operating state (Anton 27.11.):
+  //   on + jobs active/queued -> "läuft" (green)
+  //   on + waiting idle       -> "idle"  (yellow)
+  //   booting                 -> "weckt auf …" (yellow, + queued count)
+  //   shutting down           -> "schaltet ab …" (red)
+  //   off                     -> "aus" (red)
+  let label, cls;
+  if (d.up) {
+    label = busy ? "läuft" : "idle";
+    cls = busy ? "ok" : "warn";
+  } else if (d.server_state === "waking") {
+    label = d.queue.queued > 0
+      ? "weckt auf · " + d.queue.queued + " in der Schlange"
+      : "weckt auf …";
+    cls = "warn";
+  } else if (d.server_state === "shutting_down") {
+    label = "schaltet ab …";
+    cls = "bad";
+  } else {
+    label = "aus";
+    cls = "bad";
+  }
+  el.textContent = label;
+  el.className = "badge " + cls;
   document.getElementById("st-model").textContent = d.model || "–";
   document.getElementById("st-queue").textContent =
     d.queue.active + " aktiv · " + d.queue.queued + " in Warteschlange";
@@ -451,6 +481,21 @@ function renderGraph(d) {
     return;
   }
   const n = buckets.length;
+  // y-axis: rotated "Auslastung" title + 0/50/100 % ticks, then the plot
+  const chart = document.createElement("div");
+  chart.className = "lg-chart";
+  const ytitle = document.createElement("span");
+  ytitle.className = "lg-ytitle";
+  ytitle.textContent = "Auslastung";
+  const yaxis = document.createElement("div");
+  yaxis.className = "lg-yaxis";
+  for (const v of ["100 %", "50 %", "0 %"]) {
+    const tick = document.createElement("span");
+    tick.textContent = v;
+    yaxis.appendChild(tick);
+  }
+  const plot = document.createElement("div");
+  plot.className = "lg-plot";
   const track = document.createElement("div");
   track.className = "lg-track";
   const axis = document.createElement("div");
@@ -477,8 +522,12 @@ function renderGraph(d) {
       axis.appendChild(lab);
     }
   }
-  el.appendChild(track);
-  el.appendChild(axis);
+  plot.appendChild(track);
+  plot.appendChild(axis);
+  chart.appendChild(ytitle);
+  chart.appendChild(yaxis);
+  chart.appendChild(plot);
+  el.appendChild(chart);
 }
 // Distribution bar: today's server-on time split into Prefill / Generation
 // / Idle. Widths are shares of (prefill + generation + idle), so time with

@@ -861,9 +861,16 @@ function renderAdmin(data, keys) {
   $("users-tbody").innerHTML =
     html || '<tr><td colspan="8" class="muted">Noch keine Nutzungsdaten.</td></tr>';
 
+  // Keep each user's <details> open/closed state across re-renders:
+  // refresh() rebuilds the whole block every 15 s and used to drop the
+  // "open" attribute (Anton 27.11: expanded rows collapsed on their own).
+  const openNow = new Set(
+    Array.from($("daily-block").querySelectorAll("details[open]"))
+      .map((el) => el.getAttribute("data-user")));
   let dh = "";
   for (const name of users) {
-    dh += '<details><summary>' + name + "</summary><div class=\\\"dwrap\\\">" +
+    dh += '<details data-user="' + name + '"' + (openNow.has(name) ? " open" : "") +
+      "><summary>" + name + "</summary><div class=\\\"dwrap\\\">" +
       dailyTable((data.daily || {})[name] || []) + "</div></details>";
   }
   $("daily-block").innerHTML = dh || '<p class="muted">Noch keine Nutzungsdaten.</p>';

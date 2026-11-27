@@ -106,6 +106,10 @@ async def mock_llm():
 @pytest.fixture
 async def app_env(tmp_path, mock_llm):
     cfg = Config.defaults()
+    # test-only LAN fallback (a neutral, fictitious prefix - the real one is
+    # a machine-specific value that belongs in config.toml)
+    cfg.proxy.lan_prefix = "10.99.5."
+    cfg.proxy.lan_fallback_user = "anton"
     cfg.llm.base_url = mock_llm.url
     cfg.llm.boot_timeout_s = 5.0
     cfg.llm.health_interval_s = 0.2

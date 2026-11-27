@@ -18,11 +18,11 @@ from llama_proxy.state import Job, JobState
 
 @pytest.fixture
 def lan_remote(monkeypatch):
-    """Make every request look like it comes from the LAN (192.168.179.0/24)."""
+    """Make every request look like it comes from the LAN (10.99.5.0/24)."""
     monkeypatch.setattr(
         aiohttp.web_request.BaseRequest,
         "remote",
-        property(lambda self: "192.168.179.50"),
+        property(lambda self: "10.99.5.50"),
     )
 
 
@@ -50,7 +50,7 @@ def _setup_keys(app) -> None:
 def test_identity_lan_fallback(app_env):
     app, _ = app_env
     _setup_keys(app)
-    ident = resolve_web_identity(app["auth"], app["cfg"], "", "192.168.179.50")
+    ident = resolve_web_identity(app["auth"], app["cfg"], "", "10.99.5.50")
     assert ident is not None
     assert ident.name == "anton"
     assert not ident.master
@@ -68,7 +68,7 @@ def test_identity_key_wins_over_lan(app_env):
     app["cfg"].proxy.master_api_key = "mkey"
     _, key = app["keys"].create("falko")
     # from the LAN, but with a valid key -> the key's identity wins
-    ident = resolve_web_identity(app["auth"], app["cfg"], key, "192.168.179.50")
+    ident = resolve_web_identity(app["auth"], app["cfg"], key, "10.99.5.50")
     assert ident is not None
     assert ident.name == "falko"
 
@@ -87,7 +87,7 @@ def test_identity_invalid_key_fails_closed(app_env):
     app, _ = app_env
     _setup_keys(app)
     assert (
-        resolve_web_identity(app["auth"], app["cfg"], "lp-wrong-key", "192.168.179.50")
+        resolve_web_identity(app["auth"], app["cfg"], "lp-wrong-key", "10.99.5.50")
         is None
     )
 
@@ -96,7 +96,7 @@ def test_identity_lan_prefix_disabled(app_env):
     app, _ = app_env
     _setup_keys(app)
     app["cfg"].proxy.lan_prefix = ""
-    assert resolve_web_identity(app["auth"], app["cfg"], "", "192.168.179.50") is None
+    assert resolve_web_identity(app["auth"], app["cfg"], "", "10.99.5.50") is None
 
 
 # --- endpoints -------------------------------------------------------------

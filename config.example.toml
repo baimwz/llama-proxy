@@ -9,6 +9,12 @@ master_api_key = "CHANGE-ME-long-random-string"   # SECRET: required by all clie
 idle_timeout_s = 1200            # shutdown server after 20 min without requests
 client_wait_timeout_s = 600      # max wait for non-streaming requests
 sse_heartbeat_s = 15             # SSE keep-alive comment interval while booting
+# Web identity fallback: a request WITHOUT a valid key whose source IP
+# starts with `lan_prefix` is treated as `lan_fallback_user`. Empty
+# lan_prefix = disabled (every web visitor logs in with a key; the public
+# status/load pages keep working). Machine-specific -> set HERE, not in code.
+lan_prefix = ""
+lan_fallback_user = ""
 
 [llm]
 # The LLM typically runs inside a Proxmox LXC container (e.g. LXC 100) -
@@ -38,7 +44,17 @@ ssh_key_path = "/home/pi/.ssh/id_ed25519_proxmox"  # SECRET: key file, not in re
 # Tailscale cannot carry WoL). Ports tried: 9, 7, 40, 4711.
 wol_mac = "AA:BB:CC:DD:EE:FF"                      # STABLE: the server's LAN NIC MAC (see docs/deployment-v100.md)
 # wol_bcast = "192.168.1.255"                      # VARIABLE: subnet broadcast; default 255.255.255.255
+# Re-send the magic packet every N seconds while waiting for the boot
+# (0 = send exactly once). The host may still be settling into S5 when the
+# first packet goes out - re-sends are harmless.
+wol_resend_interval_s = 15
 shutdown_verify_timeout_s = 30
+# Average draw of the LLM host per phase (watts). Used ONLY to estimate
+# per-user energy (Wh) in the usage tables until real measurements
+# replace these values.
+power_idle_w = 80.0
+power_prefill_w = 270.0
+power_generation_w = 320.0
 
 [scheduler]
 large_threshold_tokens = 4096   # "new" prompt tokens >= this -> Large job

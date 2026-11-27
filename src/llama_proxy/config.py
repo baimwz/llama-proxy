@@ -20,9 +20,13 @@ class ProxyConfig:
     client_wait_timeout_s: float = 600.0
     sse_heartbeat_s: float = 15.0
     # Web page: requests arriving from this source-IP prefix (no valid key)
-    # fall back to the `lan_fallback_user` identity. Empty = no LAN fallback.
-    lan_prefix: str = "192.168.179."
-    lan_fallback_user: str = "anton"
+    # fall back to the `lan_fallback_user` identity. Empty = no LAN fallback
+    # (every web visitor must log in with a key; the public status and load
+    # pages keep working).
+    # These are machine-specific values: keep the real ones in config.toml,
+    # never in code defaults.
+    lan_prefix: str = ""
+    lan_fallback_user: str = ""
 
 
 @dataclass
